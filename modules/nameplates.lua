@@ -52,9 +52,11 @@ function OB.PlateKind(r, g, b)
 
     --[==[ **Tapped by somebody else, which the client says in grey.**
 
-         A mob another player hit first gives no loot and no experience, and the
-         only place the client says so is the colour of this bar -- there is no
-         `UnitIsTapped` on 1.12 and no flag on the plate to read.
+         A mob another player hit first gives no loot and no experience, and on
+         a stock client the only place it is said is the colour of this bar:
+         1.12 *has* `UnitIsTapped`, but a nameplate has no unit to ask it about.
+         With SuperWoW there is one -- see `KindFromUnit`, which asks directly
+         and does not need this band at all.
 
          It was falling through to `nil` here, because the four above are the
          four reactions and grey is not a reaction. A `nil` kind takes the
@@ -100,6 +102,11 @@ local COLOR_KEY = {
 }
 
 local HIDE_HEALTH_KEY = {
+    --[[ On the same terms as any other hostile NPC, which is what `SHOWN_BY`
+         already says about it. The two tables disagreed: a tapped mob was shown
+         by the enemy switch and had its health governed by nothing. ]]--
+    TAPPED = "hideEnemyNpcHealth",
+
     ENEMY_NPC = "hideEnemyNpcHealth",
     NEUTRAL_NPC = "hideNeutralNpcHealth",
     FRIENDLY_NPC = "hideFriendlyNpcHealth",
@@ -117,7 +124,7 @@ local CLASS_SUFFIX = {
 
 OB.predicates = OB.predicates or {}
 OB.predicates.plates_no_combo = function()
-    return OB.class ~= "ROGUE" and OB.class ~= "DRUID"
+    return not OB.HasComboPoints()
 end
 
 --[[ True while the plates are in damage dealer mode, which is when the tank's
@@ -472,6 +479,17 @@ local M = OB.RegisterModule({
              points are drawn and nothing at all at nought. ]]--
         comboSockets = true,
 
+        --[==[ **On.** Points earned in a fight sit on the plate after it ends
+             until something clears them, so out of combat the row is showing
+             the last pull -- asked for directly.
+
+             Phrased as *hide* rather than *show* to match the bars' own
+             `hideOOC` and the threat window's `hideOutOfCombat`. Two
+             checkboxes for one idea, one saying show and one saying hide,
+             costs a moment every visit working out which way round this one
+             is. ]==]
+        comboHideOutOfCombat = true,
+
         castbar = true,
         castTargetOnly = false,
         castbarHeight = 8,
@@ -693,6 +711,8 @@ local M = OB.RegisterModule({
         { "Show Combo Points On Target", "showCombo", "boolean",
           nil, nil, nil, nil, nil, "@plates_no_combo" },
         { "Show Empty Combo Sockets", "comboSockets", "boolean",
+          nil, nil, nil, nil, nil, "!showCombo" },
+        { "Hide Out Of Combat", "comboHideOutOfCombat", "boolean",
           nil, nil, nil, nil, nil, "!showCombo" },
         { "Combo Point Size", "comboSize", "slider", 8, 20, 1,
           nil, nil, "!showCombo" },
@@ -1727,7 +1747,36 @@ function M:IsMouseover(plate)
     return glow:IsShown() and true or false
 end
 
+--[==[ **This plate's own unit, and the plate's own GUID is asked for first.**
+
+     Ollie, 2026-10-01, with a screenshot of a Mountain Boar wearing a Rend cast
+     on a *different* Mountain Boar: *"debuffs transfer to targets of the same
+     name"*.
+
+     This answered `"target"` or `"mouseover"` and otherwise **nothing** -- so a
+     plate that was neither had no unit, and everything about it fell back to
+     matching the name written on it. Two boars share a name, so they shared a
+     debuff list.
+
+     `M:PlateUnit` has existed for a while and resolves this plate's **GUID**
+     through SuperWoW, which is a real unit token: every unit function works on
+     it. The cast bars were moved onto it for exactly this reason and wrote the
+     reasoning down -- *the suppression is honest and expensive; a GUID can say
+     which of them the log line came from*. The debuff path never learned it,
+     and neither did the health text or the identity pass.
+
+     **First, not last.** A GUID belongs to this plate by construction; `target`
+     and `mouseover` have to be matched by name, which is the thing that cannot
+     tell two boars apart. Where both are available they agree, and where they
+     do not it is the name match that is wrong.
+
+     The target and mouseover fall-backs stay for every client without SuperWoW,
+     where there is no token for an arbitrary plate at all and a name is the only
+     identity in the building. ]==]
 function M:ExactUnit(plate, name)
+    local own = self:PlateUnit(plate)
+    if own then return own end
+
     if plate.istarget and UnitExists("target") and UnitName("target") == name then
         return "target"
     end
@@ -1857,7 +1906,79 @@ function M:KnownPlayer(name)
     return nil
 end
 
-function M:KindForPlate(plate, base, name)
+--[==[ **What this mob is *now*, asked of the unit rather than read off the
+     bar.**
+
+     Ollie, 2026-10-24: *"yellow enemies turn red when aggrod by you... add grey
+     out if tapped by other player and yellow turn red when angry on nameplates
+     too not just unitframes"*.
+
+     The unit frames have always done both, because they have a unit token and
+     can ask `UnitReaction` and `UnitIsTapped`. A nameplate has no token on a
+     stock 1.12 client, so everything it knows comes from the colour the client
+     painted its health bar -- and **that colour is the mob's faction standing,
+     not its mood**. A neutral mob that has decided to kill you is still a
+     yellow bar. The tap is better served: the client does grey the bar, which
+     is why `PlateKind` has a `TAPPED` band at all.
+
+     SuperWoW gives a plate its unit's GUID, and a GUID is a unit token -- the
+     same route the cast bars and the threat colouring already take, and since
+     v0.99.353 `ExactUnit` hands it over. So where there is one, the two
+     questions the bar cannot answer are asked of the client directly, in the
+     same order the client's own `TargetFrame_CheckFaction` asks them: tapped
+     first, then reaction.
+
+     **NPCs only.** A player's plate is decided by colour and by what has been
+     verified about the name, which is a careful piece of logic about not
+     trusting a red bar -- and `UnitReaction` has nothing to add to it. Nil
+     here means "no opinion", and the bar keeps the floor. ]==]
+function M:KindFromUnit(plate, unit)
+    if not unit then return nil end
+    if type(UnitExists) ~= "function" or not UnitExists(unit) then return nil end
+
+    if type(UnitIsPlayer) == "function" and UnitIsPlayer(unit) then return nil end
+
+    --[==[ **Grey before anything else**, exactly as the client orders it: a mob
+         somebody else tagged gives you nothing, and what it would otherwise
+         have been coloured does not matter. ]==]
+    if type(UnitIsTapped) == "function" and UnitIsTapped(unit)
+            and type(UnitIsTappedByPlayer) == "function"
+            and not UnitIsTappedByPlayer(unit) then
+        return "TAPPED"
+    end
+
+    if type(UnitReaction) ~= "function" then return nil end
+
+    local reaction = UnitReaction(unit, "player")
+    if type(reaction) ~= "number" then return nil end
+
+    --[[ The same three bands the unit frames read, and the client's own: above
+         four is friendly, four is neutral, below it is hostile -- which is what
+         a neutral mob becomes the moment it swings at you. ]]--
+    if reaction > 4 then return "FRIENDLY_NPC" end
+
+    --[==[ **Neutral until it swings at you.**
+
+         A reaction is a faction standing and aggro does not move it -- a boar
+         you have pulled is still 4, which is why reading the reaction alone
+         changed nothing. Who it is attacking is the part that changes, and it
+         is the same question the threat colouring a few hundred lines down has
+         always asked. ]==]
+    if reaction == 4 then
+        if OB.UnitFightingYou(unit) then return "ENEMY_NPC" end
+        return "NEUTRAL_NPC"
+    end
+
+    return "ENEMY_NPC"
+end
+
+function M:KindForPlate(plate, base, name, unit)
+    --[[ Asked first, because it is the only one of the two that can tell a mob
+         that has turned on you from one that has not. Silent without a token,
+         and then the bar is all there is -- which is where this started. ]]--
+    local asked = self:KindFromUnit(plate, unit)
+    if asked then base = asked end
+
     if base == "FRIENDLY_PLAYER" then return "FRIENDLY_PLAYER" end
 
     --[[ A red plate becomes a player plate on proof, and the proof no longer
@@ -2128,6 +2249,15 @@ function M:PlateUnit(plate)
 
     local okExists, exists = pcall(UnitExists, token)
     if not okExists or not exists then return nil end
+
+    --[[ A plate taking on a different mob is the event worth seeing: these
+         frames are recycled, and "which unit is this plate" is the question
+         both of the reported bugs turned on. ]]--
+    if OB.auraDebug and plate.unitToken ~= token then
+        OB.Raw("|cffffd86bplate|r " .. tostring(plate.identityName)
+                .. " :: " .. tostring(token)
+                .. (cached and "   (was " .. tostring(cached) .. ")" or ""))
+    end
 
     plate.unitToken = token
     return token
@@ -3274,7 +3404,9 @@ function M:Refresh(plate)
     end
     base = base or "ENEMY_NPC"
 
-    local kind = self:KindForPlate(plate, base, name)
+    --[[ The token resolved a few lines up, rather than resolved again: it is
+         this plate's own GUID where the client gives one. ]]--
+    local kind = self:KindForPlate(plate, base, name, unit)
     plate.kind = kind
 
     -- An exact hostile player is valuable roster data. Queue its class lookup if
@@ -3491,7 +3623,21 @@ function M:Refresh(plate)
          off only the earned points are drawn. ]]--
     local points, sockets = 0, false
 
-    if plate.istarget and cfg.showCombo then
+    --[==[ **And only for a class that has combo points.**
+
+         Hiding the option row was never the same as not drawing them: the
+         setting can arrive from a shared profile, and `GetComboPoints` answers
+         0 rather than nothing for a class with none -- so the empty sockets
+         sat under every target of a warrior for ever. Asked of
+         `OB.HasComboPoints`, which is the same answer the option row and the
+         combo point bar use. ]==]
+    --[[ `OB.inCombat` rather than a call of our own: it is maintained by the
+         core `PLAYER_REGEN_*` handlers and is what the bars and the threat
+         window already read, so all of them change at the same instant. ]]--
+    local comboAllowed = cfg.showCombo and OB.HasComboPoints()
+            and not (cfg.comboHideOutOfCombat ~= false and not OB.inCombat)
+
+    if plate.istarget and comboAllowed then
         points = self:ComboPoints()
         sockets = cfg.comboSockets ~= false
     end

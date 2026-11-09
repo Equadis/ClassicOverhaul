@@ -1289,7 +1289,21 @@ function M:SetMapMovable(on)
     end
 
     self.mapDragEnabled = on and true or false
-    if on and OB.MarkMovable then OB.MarkMovable(frame, "World Map") end
+
+    --[==[ **The world map is not given a move box.**
+
+         Ollie, 2026-09-30: *"remove world map from the editbox. that can move on
+         its own"*. It can -- this function has just given it drag handles of its
+         own, which is what the block above is, and they work whether or not edit
+         mode is open.
+
+         It was registered as movable as well, which cost nothing while an
+         outline only appeared over something already on screen: the map is shut
+         almost always, so the box was almost never drawn. v0.99.343 started
+         showing a faint box for anything **inactive**, and a rectangle for a
+         window that is closed -- and that already has its own way to be moved --
+         is exactly the clutter that change was meant to avoid. ]==]
+
     return on and true or false
 end
 
@@ -2945,7 +2959,7 @@ function M:MinimapTray()
         if not GameTooltip then return end
 
         OB.OwnTooltip(this, "ANCHOR_LEFT")
-        GameTooltip:AddLine("Addon Buttons")
+        GameTooltip:SetText("Addon Buttons")
         GameTooltip:AddLine("Show or hide the minimap buttons gathered from "
                 .. "your other addons.", 1, 1, 1)
         GameTooltip:Show()
@@ -3958,7 +3972,7 @@ function M:PlaceHeaderButtons(on)
                         local up = not map or not map.IsShown or map:IsShown()
 
                         OB.OwnTooltip(this, "ANCHOR_LEFT")
-                        GameTooltip:AddLine(up and "Hide The Minimap"
+                        GameTooltip:SetText(up and "Hide The Minimap"
                                 or "Show The Minimap")
                         GameTooltip:Show()
                     end)
@@ -4191,6 +4205,27 @@ end
 
 --[[ The three boxes placed and filled, or put away. Called from the size pass
      as well, because a header is measured against the map it sits over. ]]--
+--[==[ **Zero is a legal zone size, and `or 11` does not catch it.**
+
+     `tonumber(cfg.zoneSize) or 11` reads as "eleven unless somebody chose a
+     size". It is not: **zero is truthy in Lua**, the slider starts at zero and
+     zero is what ships, so every default profile handed `SetFont` a size of
+     **0** -- which fails silently and leaves the FontString with no font at
+     all. The next `SetText` on it then errors, aborting whatever was mid-apply.
+     That is what Ollie's 2026-09-28 self-test counted as *3 of 348 font strings
+     have no font*.
+
+     Zero means "leave the client's own size alone" for `MinimapZoneText`, which
+     is the client's string and already has a font. **These are ECO's own
+     strings**: there is no size of somebody else's to preserve, they must be
+     fonted to be drawn at all, and eleven is the fallback the code already
+     meant. ]==]
+local function headerFontSize(cfg)
+    local size = tonumber(cfg and cfg.zoneSize)
+    if not size or size <= 0 then return 11 end
+    return size
+end
+
 function M:ApplyMinimapHeader()
     local holder = self:MinimapHeader()
     if not holder then return false end
@@ -4303,7 +4338,7 @@ function M:RefreshMinimapHeader()
             end
         end
 
-        OB.ApplyFont(holder.location.text, tonumber(cfg.zoneSize) or 11, "map")
+        OB.ApplyFont(holder.location.text, headerFontSize(cfg), "map")
     end
 
     if cfg.showTime then
@@ -4317,7 +4352,7 @@ function M:RefreshMinimapHeader()
             holder.clock.text:SetText(text)
         end
 
-        OB.ApplyFont(holder.clock.text, tonumber(cfg.zoneSize) or 11, "map")
+        OB.ApplyFont(holder.clock.text, headerFontSize(cfg), "map")
     end
 
     self:RefreshMinimapCoords()
@@ -4341,7 +4376,7 @@ function M:RefreshMinimapCoords()
     end
 
     self:PlaceMinimapCoords()
-    OB.ApplyFont(text, tonumber(cfg.zoneSize) or 11, "map")
+    OB.ApplyFont(text, headerFontSize(cfg), "map")
 
     local x, y
 

@@ -174,20 +174,52 @@ function OB.ApplyFont(fontstring, size, moduleId, force)
 
     local path = OB.FontPath(moduleId)
 
-    --[[ **Nothing to do if it already says that.**
+    --[==[ **Nothing to do if it already says that -- asked of the string, not of
+         a note beside it.**
 
-         `SetFont` is not free even when the font does not change -- it is a
-         client call that re-resolves the file and re-measures the string -- and
-         the tooltip asks for every line on both sides on every tick it is on
-         screen. Nothing about the answer changes between two ticks.
+         `SetFont` is not free even when the font does not change: it re-resolves
+         the file and re-measures the string, and the tooltip asks for every line
+         on both sides on every tick it is on screen. So the skip is worth
+         having. What it must not do is *believe its own record*.
 
-         Remembered on the FontString rather than in a table beside it, because
-         these are the client's own objects and outlive anything this addon
-         keeps: a line created for one tooltip is reused for the next. ]]--
-    if fontstring.eqEcoFontPath == path
-            and fontstring.eqEcoFontSize == size
-            and fontstring.eqEcoFontOutline == outline then
+         This compared three fields this addon had written on the FontString the
+         last time it styled it. That is a note about what ECO asked for, not
+         about what the string is -- and plenty of things change a font without
+         going through here:
+
+         **The client's own `SetFontObject`.** 1.12 re-applies
+         `GameTooltipHeaderText` to `GameTooltipTextLeft1` when a tooltip is
+         built with `SetText`, which is every item and every unit. That is a
+         bigger face and it arrives *after* ECO styled the line -- so the note
+         still matched, this returned early, and the client's header font stayed.
+
+         The result was reported by Ollie on 2026-09-30 and is exactly what it
+         should be: the live tooltip's **name line was larger** than the fade
+         copy's and carried no outline, because the copy is built with `AddLine`
+         and never gets the header treatment. Two tooltips showing the same item,
+         side by side, disagreeing about the first line.
+
+         Asking `GetFont()` costs one call and answers the real question. Another
+         addon restyling a shared line, a template reset, a font object swapped
+         underneath -- all of them are now noticed and put back, which no
+         remembered value could do. ]==]
+    local curPath, curSize, curFlags = fontstring:GetFont()
+
+    if curPath == path and curSize == size and curFlags == outline then
         return
+    end
+
+    --[==[ **A size the client will accept.**
+
+         `SetFont` fails outright on a size of zero or below, and it fails
+         *silently* -- the call returns and the FontString is left with no font
+         object at all. Every later `SetTextColor` or `GetStringWidth` on it is
+         then an error rather than a no-op, which is the fault this whole
+         function exists to prevent. A size that is not a usable number is a bug
+         somewhere else; it must not be allowed to strip a font here. ]==]
+    if type(size) ~= "number" or size <= 0 then
+        size = (type(look.fontSize) == "number" and look.fontSize > 0)
+                and look.fontSize or 12
     end
 
     fontstring:SetFont(path, size, outline)
@@ -197,11 +229,41 @@ function OB.ApplyFont(fontstring, size, moduleId, force)
         path = STANDARD_TEXT_FONT
     end
 
-    --[[ Recorded after the fallback, so what is remembered is what the
-         FontString actually ended up with rather than what was asked for. ]]--
-    fontstring.eqEcoFontPath = path
-    fontstring.eqEcoFontSize = size
-    fontstring.eqEcoFontOutline = outline
+    --[==[ **And a last resort, because the fallback can fail too.**
+
+         The fallback changes the *path* and keeps the size and the outline. If
+         what the client rejected was one of those two rather than the file,
+         both calls fail for the same reason and the string is left with no
+         font. Reported by Ollie's `/eq selftest` on 2026-09-28 as **3 of 348
+         font strings have no font**, and unnamed, because a string with no font
+         has no text to name it by either. ]==]
+    if not fontstring:GetFont() then
+        fontstring:SetFont(STANDARD_TEXT_FONT, 12, nil)
+        path = STANDARD_TEXT_FONT
+        size = 12
+        outline = nil
+    end
+
+    --[==[ **A failure is not remembered as a success.**
+
+         This recorded the path, size and outline unconditionally, so a
+         FontString that ended up with no font was cached as though it had one
+         -- and the short-circuit at the top of this function then matched on
+         every later pass and returned without trying again. **One failure made
+         it permanent**, which is why three of them were still fontless by the
+         time a self-test counted them.
+
+         Leaving the record unset costs one `SetFont` per pass on a string that
+         is already broken, and gets it a fresh chance every time something
+         re-fonts the interface. ]==]
+    --[[ A font that would not set leaves nothing recorded and nothing skipped:
+         the next pass asks again and repairs it, rather than the string staying
+         fontless for the session. ]]--
+    if not fontstring:GetFont() then return end
+
+    --[[ Nothing is remembered any more: the skip above reads the FontString
+         itself, so a note of what was last asked for has no reader and would
+         only be one more thing to keep in step. ]]--
 end
 
 -- ---------------------------------------------------------------------------
@@ -766,7 +828,21 @@ function OB.StyleBar(bar, slot, width, moduleId)
     local edge = OB.BorderEdge(OB.Look(moduleId).border,
             (width or slot.w) + (pad * 2), slot.h + (pad * 2))
 
-    if pad > 0 and edge then
+    --[==[ **A bar in the stack has no border of its own.**
+
+         Ollie, 2026-09-29: *"omni bars bar border would be around the entire
+         unit, not per bar"*. The bars are one group now, and a group is one
+         thing: eight stacked rectangles each in their own frame read as eight
+         widgets that happen to be touching, and the horizontal rules between
+         them are the heaviest lines on the cluster.
+
+         One edge is drawn round the whole column instead, by
+         `OB.ApplyStackBorder`. Everything else this function styles -- texture,
+         background, text -- is still per bar, because those are per bar.
+
+         The flag is set at bind time on bars in `OB.barOrder` only, so a
+         nameplate's or a party frame's bar still draws its own. ]==]
+    if pad > 0 and edge and not bar.eqInStack then
         --[==[ **Hung by the ink, not by the reserved room -- two different
              questions that `OB.BorderPad` was answering with one number.**
 

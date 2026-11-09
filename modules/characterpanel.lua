@@ -27,7 +27,12 @@ local M = OB.RegisterModule({
          while it was shut. ]==]
     events = { "UNIT_INVENTORY_CHANGED", "PLAYER_AURAS_CHANGED",
                "UNIT_AURA", "PLAYER_LEVEL_UP", "PLAYER_ENTERING_WORLD",
-               "CHARACTER_POINTS_CHANGED" },
+               "CHARACTER_POINTS_CHANGED",
+
+               --[[ Learning something is what moves a spell out of the training
+                    list, and it is the one change no other event here implies.
+                    `PLAYER_LEVEL_UP` above moves the rest of it. ]]--
+               "SPELLS_CHANGED", "LEARNED_SPELL_IN_TAB" },
     --[==[ **On, like everything else.**
 
          This module shipped off. So did twelve others, which meant a fresh
@@ -109,6 +114,11 @@ local M = OB.RegisterModule({
              how bright is bright enough depends on the artwork behind it. ]==]
         borderGlow = true,
         borderGlowAlpha = 0.55,
+
+        --[[ On. The whole point of it is that nobody knows the list is
+             knowable -- a tab that has to be switched on is one nobody switches
+             on. ]]--
+        showTraining = true,
     },
 
     options = {
@@ -145,6 +155,9 @@ local M = OB.RegisterModule({
           OB.Enum({ "base", "melee", "ranged", "defense" },
                   { "Base Stats", "Melee", "Ranged", "Defense" }),
           nil, nil, nil, nil, "!statPanes" },
+
+        { "Training", "__s_training", "section", "training" },
+        { "Show The Training Tab", "showTraining", "boolean" },
 
         { "General", "__s_general2", "section", "general" },
         { "Turn Character Model By Dragging", "modelRotate", "boolean" },
@@ -298,14 +311,34 @@ local SCHOOLS = { "Arcane", "Fire", "Frost", "Holy", "Nature", "Shadow" }
      properly" that survived two rounds of pattern work -- the patterns were
      right and the lines were somebody else's.
 
-     Capped for a client whose count cannot be trusted, and the cap is the
-     old ceiling. ]==]
+     **And then `NumLines()` answered nought.** Bounding the walk by the
+     client's count was right in principle and read nothing in practice:
+     the hit row went from wrong to a flat zero, which is what forty lines
+     of nothing adds up to. Whether the count is unreliable on a tooltip
+     that is never shown, or the owner is lost between scans, the fix is
+     the same and does not depend on which: **own the tooltip afresh before
+     every scan, and blank every line ourselves** before the client writes
+     the new ones. A line past the end is then empty rather than stale, the
+     walk can run to the cap and skip blanks, and nothing about the answer
+     rests on the client's bookkeeping. BetterCharacterStats' scanner
+     re-owns its tooltip the same way. ]==]
 local SCAN_CAP = 40
 
 local function scanCount(tip)
-    local n = tip and tip.NumLines and tip:NumLines()
-    if type(n) ~= "number" or n > SCAN_CAP then return SCAN_CAP end
-    return n
+    return SCAN_CAP
+end
+
+--[[ Ready the shared scanning tooltip for one item, talent, spell or buff:
+     owned, cleared, and every line it might already hold blanked. ]]--
+local function prepareScan(tip)
+    if tip.SetOwner and UIParent then tip:SetOwner(UIParent, "ANCHOR_NONE") end
+    if tip.ClearLines then tip:ClearLines() end
+
+    for i = 1, SCAN_CAP do
+        local line = getglobal("EquadisClassicOverhaulScanTooltipTextLeft" .. i)
+        if not line then break end
+        if line.SetText then line:SetText("") end
+    end
 end
 
 --[[ `trace`, when given, collects what was read and from where, for the
@@ -388,7 +421,7 @@ function M:GearBonuses(force)
                     or GetInventoryItemLink("player", slot)
 
             if worn then
-                if tip.ClearLines then tip:ClearLines() end
+                prepareScan(tip)
                 tip:SetInventoryItem("player", slot)
 
                 local setName
@@ -398,12 +431,14 @@ function M:GearBonuses(force)
                     local line = OB.ScanLine(index)
                     if not line then break end
 
-                    --[[ "Bloodfang Armor (3/8)": the line that names the set
-                         its bonuses belong to, read before they are. ]]--
-                    local _, _, named = string.find(line, "^(.+) %(%d+/%d+%)$")
-                    if named then setName = named end
+                    if line ~= "" then
+                        --[[ "Bloodfang Armor (3/8)": the line that names the
+                             set its bonuses belong to, read before they are. ]]--
+                        local _, _, named = string.find(line, "^(.+) %(%d+/%d+%)$")
+                        if named then setName = named end
 
-                    readGearLine(line, out, setName, out.trace)
+                        readGearLine(line, out, setName, out.trace)
+                    end
                 end
 
                 for t = before + 1, table.getn(out.trace) do
@@ -506,7 +541,7 @@ function M:TalentBonuses(force)
                 local _, _, _, _, rank = GetTalentInfo(tab, index)
 
                 if type(rank) == "number" and rank > 0 then
-                    if tip.ClearLines then tip:ClearLines() end
+                    prepareScan(tip)
                     tip:SetTalent(tab, index)
 
                     local talent = OB.ScanLine(1)
@@ -517,7 +552,7 @@ function M:TalentBonuses(force)
                                 or string.find(line, "^Next rank") then
                             break
                         end
-                        readTalentLine(line, out, talent)
+                        if line ~= "" then readTalentLine(line, out, talent) end
                     end
                 end
             end
@@ -549,7 +584,7 @@ function M:SpellbookCrit()
         if not name then break end
 
         if name == attack then
-            if tip.ClearLines then tip:ClearLines() end
+            prepareScan(tip)
             tip:SetSpell(i, BOOKTYPE_SPELL or "spell")
 
             for l = 1, scanCount(tip) do
@@ -629,7 +664,7 @@ function M:AuraBonuses(force)
                 local index = GetPlayerBuff(position, filter)
                 if type(index) ~= "number" or index < 0 then break end
 
-                if tip.ClearLines then tip:ClearLines() end
+                prepareScan(tip)
                 tip:SetPlayerBuff(index)
 
                 local aura = OB.ScanLine(1)
@@ -637,7 +672,7 @@ function M:AuraBonuses(force)
                 for i = 1, scanCount(tip) do
                     local line = OB.ScanLine(i)
                     if not line then break end
-                    readAuraLine(line, out, aura)
+                    if line ~= "" then readAuraLine(line, out, aura) end
                 end
             end
         end
@@ -1084,10 +1119,14 @@ local STAT_GROUPS = {
                  a vanilla character has: there is no base hit stat, and no
                  buff grants it. The "(gear)" that used to be on this label
                  was true when talents were not read; it is not any more. ]]--
+            --[[ A fork's own call is preferred only when it says something:
+                 a back-ported `GetHitModifier` that answers nought on every
+                 character would otherwise sit in front of a scan that knows
+                 better, and read as "stuck at 0". ]]--
             { "Hit", function()
                 local hit = ask("GetHitModifier")
                 if type(hit) ~= "number" then hit = ask("GetHitRating") end
-                if type(hit) == "number" then return statPercent(hit) end
+                if type(hit) == "number" and hit > 0 then return statPercent(hit) end
 
                 local total = hitTotal("hit", "hit")
                 if not total then return nil end
@@ -1837,7 +1876,16 @@ function M:RowTooltip(pane, index)
     end
 
     OB.OwnTooltip(row.hover, "ANCHOR_RIGHT")
-    GameTooltip:AddLine(data.label .. ": " .. tostring(data.value), 1, 1, 1)
+
+    --[==[ **`SetText` for the first line, not `AddLine`.**
+
+         `SetOwner` does not empty a tooltip on this client -- the client's own
+         code always follows it with `SetText`, which is the call that drops
+         what was there. Opening with `AddLine` instead appended these rows to
+         whatever was last shown, so hovering a stat straight after an
+         equipped slot read as the item's tooltip with a stat stuck on the
+         end, and crossing from row to row grew it a line at a time. ]==]
+    GameTooltip:SetText(data.label .. ": " .. tostring(data.value), 1, 1, 1)
 
     if data.explain then
         local ok, lines = pcall(data.explain)
@@ -1855,6 +1903,18 @@ function M:RowTooltip(pane, index)
     end
 
     GameTooltip:Show()
+
+    --[==[ **And this addon's own pass, asked for outright.**
+
+         `Show` on a tooltip that never went away does not fire `OnShow`, which
+         is where the decoration hangs -- the same crossing that the weapon
+         buff hovers had to ask for. ]==]
+    local tip = OB.modules and OB.modules.tooltip
+
+    if tip and OB.ModuleEnabled("tooltip") and tip.QueueTooltip then
+        tip:QueueTooltip(true)
+    end
+
     return true
 end
 
@@ -1867,13 +1927,772 @@ end
      is whenever anything is equipped, a buff lands, or a level is gained. The
      sheet is not open most of the time, so this costs nothing while it is
      shut. ]==]
+-- ---------------------------------------------------------------------------
+-- what your trainer would teach you
+-- ---------------------------------------------------------------------------
+
+--[==[ **The spells you have not been taught yet, which the client never says.**
+
+     1.12 tells you what you know. It does not tell you what is waiting at the
+     trainer, what is two levels away, or which of the eight ranks on the list
+     you have already bought -- so the only way to find out is to ride to a city
+     and read the trainer's window, and the only way to plan is to remember it.
+
+     Absorbed from **What's Training? Turtle**, by Sveng with the Turtle port by
+     spawnedc and rebasedkon, MIT. ECO takes the tables verbatim -- they live in
+     `data/training/` and are counted by the suite against the upstream file --
+     and rewrites the reading of them to this addon's conventions. See NOTICE.
+
+     **Three things are different from upstream**, and all three are noted where
+     they happen: race tokens are compared case-insensitively, the client's
+     `Scourge` is understood as Undead, and a deprecated `zzOLD` placeholder in
+     the warrior table is not offered. ]==]
+
+local TRAINING_ROWS = 14
+
+--[[ How close "coming soon" is. Upstream's two levels, kept: it is the span
+     you would actually ride back for. ]]--
+local TRAINING_SOON = 2
+
+--[==[ **One spelling for a race, whoever is doing the spelling.**
+
+     The tables say `NIGHTELF`, `UNDEAD`, `HIGHELF`; `UnitRace` answers
+     `Night Elf` / `NightElf`, and 1.12 calls the Forsaken `Scourge`. One row in
+     the upstream druid table says `Gnome` where its neighbours say `GNOME`.
+
+     A comparison that takes any of that literally silently drops every
+     race-restricted spell -- and dropping them looks exactly like not having
+     them, which is why it would never be reported as a bug. Both sides are
+     reduced to letters and folded up, so all four spellings meet. ]==]
+local function trainingToken(text)
+    if type(text) ~= "string" then return nil end
+
+    local up = string.upper(text)
+    up = string.gsub(up, "[^A-Z]", "")
+    if up == "" then return nil end
+
+    --[[ The client's own name for the Forsaken, which no data file uses. ]]--
+    if up == "SCOURGE" then return "UNDEAD" end
+
+    return up
+end
+
+function M:TrainingDB()
+    local db = EquadisClassicOverhaulTrainingDB
+    if type(db) == "table" and type(db.spells) == "table" then return db end
+    return nil
+end
+
+function M:TrainingClass()
+    if type(UnitClass) ~= "function" then return nil end
+
+    local ok, localised, token = pcall(UnitClass, "player")
+    if not ok then return nil end
+
+    if type(token) == "string" and token ~= "" then return string.upper(token) end
+    if type(localised) == "string" and localised ~= "" then
+        return string.upper(localised)
+    end
+
+    return nil
+end
+
+function M:TrainingRace()
+    if type(UnitRace) ~= "function" then return nil end
+
+    local ok, localised, token = pcall(UnitRace, "player")
+    if not ok then return nil end
+
+    return trainingToken(token) or trainingToken(localised)
+end
+
+--[[ A race this build does not name is a reason to show everything rather than
+     nothing: a missing answer must not empty the list. ]]--
+local function raceAllowed(spell, race)
+    if not spell.race and not spell.races then return true end
+    if not race then return true end
+
+    if spell.races then
+        for i = 1, table.getn(spell.races) do
+            if trainingToken(spell.races[i]) == race then return true end
+        end
+        return false
+    end
+
+    return trainingToken(spell.race) == race
+end
+
+--[[ **A placeholder the data still carries.** `zzOLD Pummel` is a retired rank
+     left in the warrior table; the `zz` prefix is Blizzard's own marker for a
+     spell that is no longer real. Offering to teach it would be the list's only
+     outright wrong row. ]]--
+local function trainingReal(spell)
+    if type(spell) ~= "table" then return false end
+    if type(spell.id) ~= "number" or type(spell.name) ~= "string" then
+        return false
+    end
+    if string.find(spell.name, "^zzOLD") then return false end
+
+    return true
+end
+
+--[==[ **Every spell this character could ever be taught**, flattened out of the
+     by-level tables and filtered to the race, in one list.
+
+     Cached against the class and race it was built for, because it is walked on
+     every `SPELLS_CHANGED` -- which fires for things as ordinary as a buff
+     being applied on some builds. ]==]
+function M:TrainingSpells()
+    local db = self:TrainingDB()
+    if not db then return nil end
+
+    local class = self:TrainingClass()
+    if not class then return nil end
+
+    local race = self:TrainingRace()
+    local stamp = class .. "/" .. tostring(race)
+
+    if self.trainingCacheStamp == stamp and self.trainingCache then
+        return self.trainingCache
+    end
+
+    local byLevel = db.spells[class]
+    if type(byLevel) ~= "table" then return nil end
+
+    local list = {}
+    for level, spells in pairs(byLevel) do
+        if type(spells) == "table" then
+            for i = 1, table.getn(spells) do
+                local spell = spells[i]
+                if trainingReal(spell) and raceAllowed(spell, race) then
+                    table.insert(list, spell)
+                end
+            end
+        end
+    end
+
+    self.trainingCache = list
+    self.trainingCacheStamp = stamp
+
+    return list
+end
+
+--[[ The spellbook is keyed by name and rank because that is all it answers
+     with; the tables carry the id. This is the join between them. ]]--
+local function trainingKey(name, rank)
+    return string.lower(tostring(name)) .. "\001" .. string.lower(tostring(rank or ""))
+end
+
+--[==[ **What this character already knows**, as a set of spell ids.
+
+     Walked off the spellbook rather than asked for by id, because 1.12 has no
+     "do I know spell 25286" call at all. The book answers name and rank, so the
+     class table is indexed by name and rank to meet it.
+
+     **A later rank stands for every rank below it.** Heroic Strike 9 means all
+     eight beneath it are known, and without the override table the list would
+     offer to sell you every one of them -- which is the single most visible way
+     this feature can be wrong. ]==]
+function M:KnownTrainingIds()
+    local spells = self:TrainingSpells()
+    if not spells then return {} end
+
+    local byKey = {}
+    for i = 1, table.getn(spells) do
+        local spell = spells[i]
+        local key = trainingKey(spell.name, spell.subText)
+        if not byKey[key] then byKey[key] = {} end
+        table.insert(byKey[key], spell.id)
+    end
+
+    local known = {}
+    if type(GetSpellName) ~= "function" then return known end
+
+    local db = self:TrainingDB()
+    local class = self:TrainingClass()
+    local overrides = db and class and db.overrides[class] or nil
+
+    local index = 1
+    while true do
+        local ok, name, rank = pcall(GetSpellName, index, BOOKTYPE_SPELL)
+        if not ok or not name then break end
+
+        local ids = byKey[trainingKey(name, rank)]
+        if ids then
+            for n = 1, table.getn(ids) do
+                known[ids[n]] = true
+
+                local beneath = overrides and overrides[ids[n]]
+                if beneath then
+                    for b = 1, table.getn(beneath) do known[beneath[b]] = true end
+                end
+            end
+        end
+
+        index = index + 1
+    end
+
+    return known
+end
+
+--[==[ **The list, in the five states a spell can be in.**
+
+     Returned as data rather than drawn, so every one of these can be asserted
+     without a frame: which bucket a spell lands in is the whole of this
+     feature, and it depends on level, on ranks known, and on other spells being
+     known first. ]==]
+function M:TrainingCategories()
+    local spells = self:TrainingSpells()
+    if not spells then return nil end
+
+    local known = self:KnownTrainingIds()
+
+    local level = 1
+    if type(UnitLevel) == "function" then
+        local ok, value = pcall(UnitLevel, "player")
+        if ok and type(value) == "number" then level = value end
+    end
+
+    local out = { available = {}, missing = {}, soon = {}, later = {},
+                  known = {} }
+
+    for i = 1, table.getn(spells) do
+        local spell = spells[i]
+
+        if known[spell.id] then
+            table.insert(out.known, spell)
+        elseif spell.level > level then
+            if (spell.level - level) <= TRAINING_SOON then
+                table.insert(out.soon, spell)
+            else
+                table.insert(out.later, spell)
+            end
+        else
+            --[[ Trainable by level, but a rank you have not bought yet may sit
+                 in front of it. ]]--
+            local blocked = false
+            if spell.requiredIds then
+                for r = 1, table.getn(spell.requiredIds) do
+                    if not known[spell.requiredIds[r]] then
+                        blocked = true
+                        break
+                    end
+                end
+            end
+
+            if blocked then
+                table.insert(out.missing, spell)
+            else
+                table.insert(out.available, spell)
+            end
+        end
+    end
+
+    local function byLevelThenName(a, b)
+        if a.level == b.level then return a.name < b.name end
+        return a.level < b.level
+    end
+
+    table.sort(out.available, byLevelThenName)
+    table.sort(out.missing, byLevelThenName)
+    table.sort(out.soon, byLevelThenName)
+    table.sort(out.later, byLevelThenName)
+    table.sort(out.known, byLevelThenName)
+
+    return out
+end
+
+--[[ The order the sections are drawn in, and what each is called. Available
+     first: it is the only one you can act on today. ]]--
+local TRAINING_SECTIONS = {
+    { key = "available", label = "Available now",
+      colour = "|cff40ff40", hideLevel = true },
+    { key = "missing",   label = "Available, but a rank is missing",
+      colour = "|cffff8040" },
+    { key = "soon",      label = "Coming soon",
+      colour = "|cff82c5ff" },
+    { key = "later",     label = "Not yet available",
+      colour = "|cffff4040" },
+    { key = "known",     label = "Already known",
+      colour = "|cff9d9d9d", hideLevel = true },
+}
+
+--[==[ **Flattened into rows once**, headers and spells together, because the
+     list scrolls and a scroll offset into a tree is a second data structure to
+     keep in step with the first. ]==]
+function M:TrainingRows()
+    local cats = self:TrainingCategories()
+    if not cats then return nil end
+
+    local rows = {}
+    for i = 1, table.getn(TRAINING_SECTIONS) do
+        local section = TRAINING_SECTIONS[i]
+        local list = cats[section.key]
+
+        if list and table.getn(list) > 0 then
+            table.insert(rows, { header = true, label = section.label,
+                    colour = section.colour, count = table.getn(list) })
+
+            for n = 1, table.getn(list) do
+                table.insert(rows, { spell = list[n],
+                        hideLevel = section.hideLevel,
+                        colour = section.colour })
+            end
+        end
+    end
+
+    return rows
+end
+
+--[==[ **Where it is drawn: the spellbook, on a tab of the client's own.**
+
+     This module owns the code because the character panel is where ECO keeps
+     what-am-I information, but the *tab* belongs beside the spellbook: it is a
+     list of spells, the client already has a column of skill-line tabs down the
+     right of that frame, and upstream put it there. Somewhere a player would
+     look beats somewhere the code happens to live.
+
+     Built with the client's own art, per the standing rule -- the same
+     `SpellBook-SkillLineTab` backdrop the client's own tabs use. ]==]
+function M:TrainingTab()
+    if self.trainingTab then return self.trainingTab end
+
+    local book = getglobal("SpellBookFrame")
+    if not book or type(CreateFrame) ~= "function" then return nil end
+
+    local tab = CreateFrame("CheckButton", "EquadisClassicOverhaulTrainingTab",
+            book)
+    tab:SetWidth(32)
+    tab:SetHeight(32)
+    tab:SetPoint("BOTTOMRIGHT", book, "BOTTOMRIGHT", -7, 86)
+
+    tab:SetNormalTexture("Interface\\Icons\\INV_Misc_Book_09")
+    tab:SetCheckedTexture("Interface\\Buttons\\UI-Quickslot-Depress")
+    tab:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+
+    local backdrop = tab:CreateTexture(nil, "BACKGROUND")
+    backdrop:SetTexture("Interface\\SpellBook\\SpellBook-SkillLineTab")
+    backdrop:SetWidth(64)
+    backdrop:SetHeight(64)
+    backdrop:SetPoint("TOPLEFT", tab, "TOPLEFT", -4, 11)
+
+    tab:SetScript("OnClick", function() M:ToggleTrainingPanel() end)
+
+    --[[ Opened with `SetText`, which is the call that empties a tooltip on this
+         client -- `SetOwner` does not and `Hide` does not. ]]--
+    tab:SetScript("OnEnter", function()
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(this, "ANCHOR_LEFT")
+        GameTooltip:SetText("What's Training?")
+        GameTooltip:AddLine("What your class trainer can teach you.", 1, 1, 1)
+        GameTooltip:Show()
+    end)
+    tab:SetScript("OnLeave", function()
+        if GameTooltip then GameTooltip:Hide() end
+    end)
+
+    self.trainingTab = tab
+    return tab
+end
+
+function M:TrainingPanel()
+    if self.trainingPanel then return self.trainingPanel end
+
+    local book = getglobal("SpellBookFrame")
+    if not book or type(CreateFrame) ~= "function" then return nil end
+
+    local panel = CreateFrame("Frame",
+            "EquadisClassicOverhaulTrainingPanel", book)
+    panel:SetPoint("TOPLEFT", book, "TOPLEFT", 0, 0)
+    panel:SetPoint("BOTTOMRIGHT", book, "BOTTOMRIGHT", 0, 0)
+    panel:SetFrameLevel(book:GetFrameLevel() + 5)
+    panel:Hide()
+
+    local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", panel, "TOP", 0, -46)
+    title:SetText("What's Training?")
+    panel.title = title
+
+    local empty = panel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    empty:SetPoint("CENTER", panel, "CENTER", 0, 0)
+    empty:SetText("Nothing to train.")
+    empty:Hide()
+    panel.empty = empty
+
+    --[==[ **Scrolled by moving what is drawn**, not by a scroll frame: a fixed
+         set of rows and an offset into the list. Fourteen frames exist for the
+         life of the session however long the list is. ]==]
+    panel.rows = {}
+    for i = 1, TRAINING_ROWS do
+        local row = CreateFrame("Button", nil, panel)
+        row:SetWidth(280)
+        row:SetHeight(16)
+
+        if i == 1 then
+            row:SetPoint("TOPLEFT", panel, "TOPLEFT", 26, -74)
+        else
+            row:SetPoint("TOPLEFT", panel.rows[i - 1], "BOTTOMLEFT", 0, -2)
+        end
+
+        local icon = row:CreateTexture(nil, "ARTWORK")
+        icon:SetWidth(14)
+        icon:SetHeight(14)
+        icon:SetPoint("LEFT", row, "LEFT", 0, 0)
+        row.icon = icon
+
+        local label = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        label:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+        label:SetJustifyH("LEFT")
+        row.label = label
+
+        local level = row:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        level:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+        row.level = level
+
+        row.index = i
+        row:SetScript("OnEnter", function() M:TrainingRowTooltip(this) end)
+        row:SetScript("OnLeave", function()
+            if GameTooltip then GameTooltip:Hide() end
+        end)
+        row:Hide()
+
+        panel.rows[i] = row
+    end
+
+    --[[ 1.12 wires no wheel for you, on any frame. ]]--
+    panel:EnableMouseWheel(true)
+    panel:SetScript("OnMouseWheel", function()
+        local step = 1
+        if type(IsShiftKeyDown) == "function" and IsShiftKeyDown() then
+            step = TRAINING_ROWS
+        end
+        M:ScrollTraining(-(arg1 or 0) * step)
+    end)
+
+    self.trainingPanel = panel
+    self.trainingOffset = 0
+
+    return panel
+end
+
+function M:ScrollTraining(delta)
+    local rows = self.trainingRows
+    if not rows then return false end
+
+    local most = table.getn(rows) - TRAINING_ROWS
+    if most < 0 then most = 0 end
+
+    local want = (self.trainingOffset or 0) + (delta or 0)
+    if want < 0 then want = 0 end
+    if want > most then want = most end
+
+    if want == self.trainingOffset then return false end
+
+    self.trainingOffset = want
+    self:DrawTrainingPanel()
+
+    return true
+end
+
+function M:TrainingRowTooltip(row)
+    if not row or not GameTooltip then return false end
+
+    local entry = row.entry
+    if not entry or not entry.spell then return false end
+
+    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+
+    --[[ `SetText` first: on this client it is the call that drops what was
+         there, and opening with `AddLine` appends to the last tooltip. ]]--
+    GameTooltip:SetText(entry.spell.name)
+
+    if entry.spell.subText then
+        GameTooltip:AddLine(entry.spell.subText, 0.6, 0.6, 0.6)
+    end
+    if entry.spell.school then
+        GameTooltip:AddLine(entry.spell.school, 1, 1, 1)
+    end
+    GameTooltip:AddLine("Trained at level " .. tostring(entry.spell.level),
+            1, 0.82, 0)
+
+    GameTooltip:Show()
+    return true
+end
+
+function M:DrawTrainingPanel()
+    local panel = self.trainingPanel
+    if not panel then return false end
+
+    local rows = self.trainingRows or {}
+    local total = table.getn(rows)
+
+    if panel.empty then
+        if total == 0 then panel.empty:Show() else panel.empty:Hide() end
+    end
+
+    for i = 1, TRAINING_ROWS do
+        local row = panel.rows[i]
+        local entry = rows[i + (self.trainingOffset or 0)]
+
+        row.entry = entry
+
+        if not entry then
+            row:Hide()
+        else
+            row:Show()
+
+            if entry.header then
+                row.icon:Hide()
+                row.label:SetText((entry.colour or "")
+                        .. entry.label .. " (" .. entry.count .. ")|r")
+                row.level:SetText("")
+                row:EnableMouse(false)
+            else
+                row.icon:Show()
+                row.icon:SetTexture(entry.spell.icon)
+                row.label:SetText("   " .. (entry.colour or "")
+                        .. entry.spell.name .. "|r"
+                        .. (entry.spell.subText
+                                and (" |cff808080" .. entry.spell.subText .. "|r")
+                                or ""))
+                row.level:SetText(entry.hideLevel and ""
+                        or ("|cff808080" .. entry.spell.level .. "|r"))
+                row:EnableMouse(true)
+            end
+        end
+    end
+
+    return true
+end
+
+function M:RefreshTraining()
+    if not self.trainingPanel then return false end
+
+    self.trainingRows = self:TrainingRows() or {}
+
+    local most = table.getn(self.trainingRows) - TRAINING_ROWS
+    if most < 0 then most = 0 end
+    if (self.trainingOffset or 0) > most then self.trainingOffset = most end
+
+    return self:DrawTrainingPanel()
+end
+
+--[==[ **A frame laid over the spellbook covers nothing.**
+
+     Reported by Ollie the day this shipped: *"whats training icons are bugged.
+     normal spells still show"*. Two symptoms, one cause -- the panel had no
+     background, and 1.12 keeps the twelve spell buttons, the page number and
+     the skill-line tabs as **siblings** of anything an addon adds to that
+     frame. So the client's page went on being drawn underneath, its 37-pixel
+     spell icons sitting behind this list's 14-pixel ones. The "bugged icons"
+     were the client's own icons showing through.
+
+     **Hidden rather than covered.** Upstream lays two opaque page textures of
+     its own over the book; this addon's standing rule is to use the client's
+     own art on the client's own frames, and the book's parchment is already
+     there -- so what is drawn on it is put away instead, and nothing has to
+     match anything.
+
+     **`SPELLS_PER_PAGE` is the client's own constant**, with 12 only as the
+     fallback for a build that does not export it. Hard-coding it would leave a
+     thirteenth button drawn on a fork that had one. ]==]
+local function trainingBookParts()
+    local parts = { "SpellBookPrevPageButton", "SpellBookNextPageButton",
+                    "SpellBookPageText" }
+
+    local perPage = 12
+    if type(SPELLS_PER_PAGE) == "number" and SPELLS_PER_PAGE > 0 then
+        perPage = SPELLS_PER_PAGE
+    end
+
+    for i = 1, perPage do
+        table.insert(parts, "SpellButton" .. i)
+    end
+
+    return parts
+end
+
+--[==[ **Shown again and left to the client to fill.**
+
+     `SpellButton_UpdateButton` begins `if not this:IsVisible() then return
+     end`, and it is what puts the icon, the name and the rank on a button. A
+     button hidden by an addon therefore stops being repainted -- so handing
+     these back is `Show()` and nothing else. The client's own `OnShow` runs
+     `SpellButton_UpdateButton` and fills it.
+
+     Emptying them by hand would be the mistake this comment exists to prevent:
+     the client hides a spell-less button's *contents*, never the button. ]==]
+function M:ShowBookParts(show)
+    local parts = trainingBookParts()
+
+    for i = 1, table.getn(parts) do
+        local f = getglobal(parts[i])
+        if f and f.Show and f.Hide then
+            if show then f:Show() else f:Hide() end
+        end
+    end
+
+    return true
+end
+
+--[==[ **Whoever is loaded now, looked up by name.**
+
+     A hook lives on a frame the client owns, and that frame outlives this
+     addon's load: `/reload` rebuilds the addon from its files, and every
+     upvalue a hook captured -- `M`, and `OB` with it -- then belongs to a load
+     nobody is using any more. Acting through those closes a panel that is not
+     on screen and leaves the one that is.
+
+     The global name is the only handle that still means "the addon" after
+     that, so the hooks ask for it when they fire rather than remembering it. ]==]
+local function trainingModule()
+    local addon = getglobal("EquadisClassicOverhaul")
+    if type(addon) ~= "table" or type(addon.modules) ~= "table" then
+        return nil
+    end
+
+    return addon.modules.characterpanel
+end
+
+--[[ The skill-line tabs down the right edge stay where they are -- they are how
+     you get back to the book -- but none of them is the open one while this
+     list is up, and clicking one has to put the book back. ]]--
+function M:HookBookTabs()
+    if self.trainingTabsHooked then return false end
+
+    local most = 8
+    if type(MAX_SKILLLINE_TABS) == "number" and MAX_SKILLLINE_TABS > 0 then
+        most = MAX_SKILLLINE_TABS
+    end
+
+    for i = 1, most do
+        local tab = getglobal("SpellBookSkillLineTab" .. i)
+
+        --[==[ **Marked on the frame, not on this module.**
+
+             A flag on the module is a flag on *this* load of it, and the frame
+             outlives that: hooking again on the next one stacks a second
+             wrapper on the first, and a third on that. The frame is what is
+             being hooked, so the frame is what remembers. ]==]
+        if tab and tab.GetScript and not tab.eqTrainingHooked then
+            local previous = tab:GetScript("OnClick")
+
+            --[==[ **Chained rather than replaced**: the client's own handler is
+                 what changes the page, and an addon that drops it has taken the
+                 spellbook's tabs away from it.
+
+                 **And it calls the module that is loaded now.** Capturing `M`
+                 captures the load that installed the hook, which after a reload
+                 is a module nobody is using any more -- it would close a panel
+                 that is not on screen and leave the one that is. ]==]
+            tab:SetScript("OnClick", function()
+                local mod = trainingModule()
+                if mod then mod:ToggleTrainingPanel(false) end
+                if previous then previous() end
+            end)
+
+            tab.eqTrainingHooked = true
+        end
+    end
+
+    self.trainingTabsHooked = true
+    return true
+end
+
+function M:UncheckBookTabs()
+    local most = 8
+    if type(MAX_SKILLLINE_TABS) == "number" and MAX_SKILLLINE_TABS > 0 then
+        most = MAX_SKILLLINE_TABS
+    end
+
+    for i = 1, most do
+        local tab = getglobal("SpellBookSkillLineTab" .. i)
+        if tab and tab.SetChecked then tab:SetChecked(nil) end
+    end
+
+    return true
+end
+
+function M:ToggleTrainingPanel(show)
+    local panel = self:TrainingPanel()
+    if not panel then return false end
+
+    if show == nil then show = not panel:IsShown() end
+
+    if show then
+        self.trainingOffset = 0
+        self:RefreshTraining()
+        self:ShowBookParts(false)
+        self:UncheckBookTabs()
+        panel:Show()
+    else
+        panel:Hide()
+        self:ShowBookParts(true)
+    end
+
+    if self.trainingTab then self.trainingTab:SetChecked(show and 1 or nil) end
+
+    return true
+end
+
+--[[ The tab only makes sense once the spellbook exists, and 1.12 builds that
+     frame on load rather than on first open, so a boot is late enough. ]]--
+function M:ApplyTraining()
+    if not self:Config().showTraining then
+        if self.trainingTab then self.trainingTab:Hide() end
+        if self.trainingPanel then self:ToggleTrainingPanel(false) end
+        return false
+    end
+
+    local tab = self:TrainingTab()
+    if not tab then return false end
+
+    tab:Show()
+    self:TrainingPanel()
+    self:HookBookTabs()
+
+    --[==[ **The book closing closes this.**
+
+         Without it the panel is still up the next time the spellbook opens,
+         with the client's own page hidden underneath it and no obvious way
+         back -- and `ToggleTrainingPanel` is the only thing that hands those
+         parts back. Hooked once, chained onto whatever was there. ]==]
+    local book = getglobal("SpellBookFrame")
+    if book and book.GetScript and not book.eqTrainingHooked then
+        local previous = book:GetScript("OnHide")
+
+        book:SetScript("OnHide", function()
+            local mod = trainingModule()
+            if mod then mod:ToggleTrainingPanel(false) end
+            if previous then previous() end
+        end)
+
+        book.eqTrainingHooked = true
+    end
+
+    if self.trainingPanel and self.trainingPanel:IsShown() then
+        self:RefreshTraining()
+    end
+
+    return true
+end
+
 function M:OnEvent()
+    --[[ The training list is not on the paper doll and must not be gated behind
+         it -- learning a spell with the sheet shut still changes the list. ]]--
+    if event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB"
+            or event == "PLAYER_LEVEL_UP" then
+        self.trainingCacheStamp = nil
+        self:ApplyTraining()
+    end
+
     if not getglobal("PaperDollFrame") then return end
     self:ApplyStats()
 end
 
 function M:OnBind()
     self:ApplyStats()
+    self:ApplyTraining()
 end
 
 function M:OnUnbind()
@@ -1886,6 +2705,7 @@ end
 
 function M:AfterSet()
     self:ApplyStats()
+    self:ApplyTraining()
 end
 
 function M:DebugStats()

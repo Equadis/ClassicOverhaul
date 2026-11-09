@@ -78,6 +78,20 @@ local FAMILIES = {
      spacing arithmetic wants the unscaled size. ]]--
 local BUTTON = 36
 
+--[==[ **The client's own bar frame for each family of buttons.**
+
+     Only the four multibars are here, and that is not an oversight.
+     `ActionButton_GetPagedID` asks a button's parent for its *name* and
+     compares it against exactly these four; anything else falls to its last
+     branch, which is right for the main bar and the bonus bar however they are
+     parented. So those two need nothing and are deliberately absent. ]==]
+local HOME_BAR = {
+    MultiBarBottomLeftButton = "MultiBarBottomLeft",
+    MultiBarBottomRightButton = "MultiBarBottomRight",
+    MultiBarRightButton = "MultiBarRight",
+    MultiBarLeftButton = "MultiBarLeft",
+}
+
 --[[ **The eight bars, and where each one starts.**
 
      `FAMILIES` above is what the client calls the buttons; this is what this
@@ -705,7 +719,40 @@ local M = OB.RegisterModule({
 
                --[[ Reputation changes, so the bar can follow the faction you
                     are actually earning when none is pinned. ]]--
-               "CHAT_MSG_COMBAT_FACTION_CHANGE" },
+               "CHAT_MSG_COMBAT_FACTION_CHANGE",
+
+               --[==[ **The events that change the numbers these bars draw.**
+
+                    Ollie, 2026-09-24: *"number does [not] update till ui
+                    opened"*. The bars were drawn correctly and then never drawn
+                    again: **not one of the events that moves experience or
+                    reputation was registered**, so the only redraws they got
+                    were incidental -- entering combat, leaving it, an aura
+                    changing, a zone load. Kill something and the number sat at
+                    whatever it said when the last unrelated event happened to
+                    fire, until something else opened and forced a pass.
+
+                    That is why it looked like the UI "fixed" it. Nothing about
+                    opening a panel repairs a bar; opening one simply causes the
+                    re-apply that gaining the experience should have caused.
+
+                    `CHAT_MSG_COMBAT_FACTION_CHANGE` above is **not** this event
+                    and does not cover it: it is how the bar learns *which*
+                    faction was last earned, it carries no values, and it only
+                    fires for reputation from combat -- a quest turn-in moved
+                    the number with nothing listening. ]==]
+               "PLAYER_XP_UPDATE",
+               "UPDATE_FACTION",
+
+               --[[ The rested pool is drawn as its own overlay, and it drains
+                    as you spend it -- so it moves without experience being
+                    gained and needs its own event. ]]--
+               "UPDATE_EXHAUSTION",
+
+               --[[ A level changes the maximum, and at the cap the bar stops
+                    being drawn at all. Both are decisions this module makes
+                    from numbers that only this event announces. ]]--
+               "PLAYER_LEVEL_UP" },
 
     --[[ The keybinding half of this module.
 
@@ -947,8 +994,45 @@ function M:LayoutFamily(prefix, count, anchor, rows, spacing, scale, alpha, show
                  **Only when it has moved.** Re-parenting every pass would drop
                  and rebuild the frame's position each time a slider moved,
                  which reads as a flicker and gets blamed on the client. ]]--
+            --[[ **Which of the client's bars this button belongs to**, written
+                 down before it stops being able to say so. See `HomeBar` and
+                 `InstallPagedIDHook`: the client works out which action slot a
+                 button fires from the *name of its parent frame*, and the line
+                 below is about to take that away.
+
+                 Set on every pass rather than beside the re-parent, because the
+                 re-parent only happens once and a reload rebuilds this module
+                 while the frames outlive it. ]]--
+            if HOME_BAR[prefix] then button.ecoHomeBar = HOME_BAR[prefix] end
+
             if button.SetParent and button:GetParent() ~= anchor then
                 button:SetParent(anchor)
+            end
+
+            --[==[ **And the slot is worked out again.**
+
+                 `button.action` is a cached field and `MultiActionButtonUp`
+                 casts *that* rather than asking afresh. A button carrying the
+                 number the client worked out while it was parented somewhere
+                 else goes on firing it until something happens to recompute: a
+                 page change, a form, a spell dragged onto a bar. Which is to
+                 say a reload would not have put it right, and that is how this
+                 reached a second report.
+
+                 Outside the re-parent above on purpose. By the second login the
+                 button is already on our container, so a correction that only
+                 ran when it moved would never run again -- which is exactly the
+                 state a character is in after the first bad login.
+
+                 Cheap: the client's own updater compares before it writes, so a
+                 slot that has not changed costs one comparison. `this` is how
+                 1.12 passes a button to it; saved and put back, because anything
+                 reading it after this is entitled to find what it left. ]==]
+            if button.ecoHomeBar and type(ActionButton_UpdateAction) == "function" then
+                local saved = this
+                this = button
+                pcall(ActionButton_UpdateAction)
+                this = saved
             end
 
             button:ClearAllPoints()
@@ -1215,39 +1299,91 @@ end
      the keybind answers and it should not answer it differently. ]]--
 local BAG_TEXTURE = "Interface\\Buttons\\Button-Backpack-Up"
 
+--[==[ **The client's own slot furniture, which is what makes a square a slot.**
+
+     The same four textures `modules/bags.lua` dresses every bag square in, and
+     for the reason recorded there: the raised rim somebody recognises is
+     `UI-Quickslot2` drawn *over* the icon's edges, not a border beside it.
+
+     The ring is a picture of a rim with a clear middle and the rim sits well
+     inside the image, so it has to be drawn larger than the button or it lands
+     across the middle of the icon. Thirty-four over twenty is the bag strip's
+     own ratio and the client's own overhang. ]==]
+local SLOT_RING = "Interface\\Buttons\\UI-Quickslot2"
+local SLOT_PUSHED = "Interface\\Buttons\\UI-Quickslot-Depress"
+local SLOT_HILIGHT = "Interface\\Buttons\\ButtonHilight-Square"
+local RING_OVERHANG = 34 / 20
+
 local BAG_BUTTONS = {
     "MainMenuBarBackpackButton", "CharacterBag0Slot", "CharacterBag1Slot",
     "CharacterBag2Slot", "CharacterBag3Slot", "KeyRingButton",
 }
---[[ Whatever the client draws on its backpack button, or the stock path when
-     there is nothing to read. Asked each time rather than cached: a UI addon
-     may restyle that button after this one is built. ]]--
-function M:BackpackTexture()
-    local pack = getglobal("MainMenuBarBackpackButton")
 
-    if pack and pack.GetNormalTexture then
-        local tex = pack:GetNormalTexture()
-        local path = tex and tex.GetTexture and tex:GetTexture()
+--[==[ **A rim is not a picture of anything**, and one drawn where an icon
+     belongs is an empty bordered box.
 
-        --[==[ **Not if what is on it now is ours.**
+     Matched on lowercased fragments rather than against whole paths: the client
+     spells these inconsistently between its XML and its Lua, and a case that
+     did not match would quietly put the rim back. ]==]
+local BORDER_ART = {
+    "quickslot", "emptyslot", "slot-background", "buttonhilight",
+    "ui-slot", "ui-emptyslot",
+}
 
-             This copies the client's own backpack art off the client's own
-             button, which is right until something has already restyled that
-             button -- and this addon does exactly that, on the same bar, in the
-             same pass. What came back then was `SkinButton`'s border, and the
-             bag button drew a border where a bag should be.
+local function wearableArt(path)
+    if type(path) ~= "string" or path == "" then return false end
 
-             Reported as "the bag icon isn't showing, it's using the UI border",
-             which is precisely what it was doing.
+    --[[ This addon's own media. `SkinButton` strips a button's normal texture
+         and paints its own fills, so a button ECO has already restyled has
+         nothing on it worth copying. ]]--
+    if string.find(path, "EquadisClassicOverhaul", 1, true) then return false end
 
-             Anything under this addon's own media path is refused, and the
-             known vanilla path is used instead -- a fallback that is right
-             rather than a copy that is wrong. ]==]
-        local ours = path and OB.mediaPath
-                and string.find(path, "EquadisClassicOverhaul", 1, true)
+    local lower = string.lower(path)
 
-        if path and not ours then return path end
+    for i = 1, table.getn(BORDER_ART) do
+        if string.find(lower, BORDER_ART[i], 1, true) then return false end
     end
+
+    return true
+end
+
+--[==[ **The picture on the client's backpack button, which is not its normal
+     texture.**
+
+     Ollie, 2026-10-01: *"revamp the bag button icon. its empty at the moment,
+     and using the border, not real in-game assets"*. Both halves of that were
+     one fault.
+
+     `MainMenuBarBackpackButton` is an `ItemButtonTemplate`, and on every item
+     button in a 1.12 interface the **normal texture is the quickslot rim** while
+     the picture lives on `$parentIconTexture`. This read `GetNormalTexture()`,
+     so what it copied was the rim -- stretched to fill the button and set
+     inside ECO's own border square, which is exactly an empty bordered box with
+     a second border inside it.
+
+     `modules/bags.lua` has had this right for a long time: it draws
+     `UI-Quickslot2` as the *ring* over its own icon, and names
+     `Button-Backpack-Up` as the backpack's picture. This file was reading one
+     and calling it the other.
+
+     The icon region first, the normal texture second -- a UI addon that replaces
+     the whole button may well put its art there -- and anything that is plainly
+     a rim is refused in favour of the known vanilla path, because a fallback
+     that is right beats a copy that is wrong.
+
+     Asked each time rather than cached: the button lives for the session and a
+     UI addon may restyle the backpack after it is built. ]==]
+function M:BackpackTexture()
+    local icon = getglobal("MainMenuBarBackpackButtonIconTexture")
+    local path = icon and icon.GetTexture and icon:GetTexture()
+
+    if wearableArt(path) then return path end
+
+    local pack = getglobal("MainMenuBarBackpackButton")
+    local tex = pack and pack.GetNormalTexture and pack:GetNormalTexture()
+    path = tex and tex.GetTexture and tex:GetTexture()
+
+    if wearableArt(path) then return path end
 
     return BAG_TEXTURE
 end
@@ -1264,31 +1400,38 @@ function M:BagButton()
     button:SetHeight(36)
     button:Hide()
 
-    --[==[ **A bordered square, drawn before the icon so it sits behind it.**
+    --[==[ **Dressed as a bag slot, in the client's own art.**
 
-         On the bar this button replaces, the slot art is what said "this is a
-         thing you click"; on its own in the middle of the screen the icon
-         alone reads as a stray picture. `OB.SkinButton` is the same square
-         every other button in this addon wears, so it is one border rather
-         than a second idea of what one looks like. ]==]
-    if OB.SkinButton then OB.SkinButton(button) end
+         It wore `OB.SkinButton` -- this addon's gold square -- on the reasoning
+         that an icon alone in the middle of the screen reads as a stray
+         picture. True, and the wrong answer: a thing you click to open your
+         bags is an item slot, and the client has item slots. ECO's own skin is
+         for the setup walkthrough and the options panel; anything drawn where
+         the client's interface lives uses the client's widgets.
 
-    button.icon = button:CreateTexture(nil, "ARTWORK")
-    --[[ **The client's own backpack art, at whatever size this button is.**
+         So: a black backing, the picture over it, and the client's rim over
+         that, pressing and lighting the way every other slot in the game does.
+         Three textures the player already knows instead of one this addon
+         invented, and it is the same dressing `modules/bags.lua` gives the bag
+         strip -- one answer to "what does a bag slot look like" rather than
+         two that drift. ]==]
+    button.bg = button:CreateTexture(nil, "BACKGROUND")
+    button.bg:SetAllPoints(button)
+    button.bg:SetTexture(0, 0, 0, 1)
 
-         Read off `MainMenuBarBackpackButton` rather than named here, so this
-         is the same picture the bag bar was showing -- including on a client
-         or UI addon that ships its own. A path written here would be a second
-         answer to "what does a bag look like", and the two would drift.
+    button:SetNormalTexture(SLOT_RING)
+    button:SetPushedTexture(SLOT_PUSHED)
+    button:SetHighlightTexture(SLOT_HILIGHT)
 
-         `BAG_TEXTURE` stays as the fallback for a client that has no such
-         button to copy, which is the only case where a name here is the
-         best available answer. ]]--
-    --[[ The second of these used to be unconditional, so the client's own
-         art was read and then immediately thrown away -- the fallback was
-         overwriting the thing it was a fallback for. It is only reached now
-         when there is nothing to copy. ]]--
-    button.icon:SetTexture(self:BackpackTexture() or BAG_TEXTURE)
+    --[[ Over the backing and under the rim, which is the order an item button
+         draws them in. ]]--
+    button.icon = button:CreateTexture(nil, "BORDER")
+
+    --[[ Read off the client's own backpack rather than named here, so this is
+         the picture the bag bar was showing -- including on a client or UI addon
+         that ships its own. See `BackpackTexture` for which region that is and
+         why it matters. ]]--
+    button.icon:SetTexture(self:BackpackTexture())
 
     --[[ Registered for the right button as well, so the two ways of opening
          bags the client offers are both here rather than one of them being
@@ -1444,14 +1587,30 @@ function M:ApplyBagButton()
     button:SetWidth(size)
     button:SetHeight(size)
 
-    --[[ Inset, so the square is a border around the icon rather than a line
-         underneath its edge. Proportional: a 64px button with a 3px inset
-         looks like a mistake at 20. ]]--
+    --[==[ **The picture fills the button and the rim overhangs it.**
+
+         The icon used to be inset instead, which is the right shape for a
+         border drawn *beside* an icon and the wrong one for a rim drawn *over*
+         its edges -- the client's slots lose a couple of pixels of picture to
+         the rim, and that overlap is what makes them look raised.
+
+         Left to itself a normal texture takes the button's size, and at that
+         size `UI-Quickslot2`'s rim shrinks to a square across the middle of the
+         icon with the picture showing round the outside of it. That failure has
+         been found twice already in this addon, in the bag strip and in the
+         item slot; the ratio is theirs. ]==]
     if button.icon then
-        local inset = math.floor(size / 12) + 1
         button.icon:ClearAllPoints()
-        button.icon:SetPoint("TOPLEFT", button, "TOPLEFT", inset, -inset)
-        button.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -inset, inset)
+        button.icon:SetAllPoints(button)
+    end
+
+    local ring = button.GetNormalTexture and button:GetNormalTexture()
+
+    if ring and ring.SetWidth then
+        ring:ClearAllPoints()
+        ring:SetWidth(size * RING_OVERHANG)
+        ring:SetHeight(size * RING_OVERHANG)
+        ring:SetPoint("CENTER", button, "CENTER", 0, 0)
     end
 
     local saved = cfg.positions and cfg.positions.bagButton
@@ -1941,6 +2100,100 @@ function M:InstallHotkeyHook()
         if not target then return end
 
         return EquadisClassicOverhaul.modules.actionbars:UpdateHotkey(target)
+    end
+
+    return true
+end
+
+--[==[ **Which action slot a button fires, when this addon has moved it.**
+
+     Ollie, 2026-10-23: *"I STILL CANT use the spells. the button highlights
+     when i press the keybind, but the spell doesnt cast"*. Every one of his
+     shift keys is bound to the Bottom Left bar, and on that character this
+     module owns the bars.
+
+     The client's own `ActionButton_GetPagedID` -- read out of
+     `Interface\FrameXML\ActionButton.lua` -- decides the slot like this:
+
+         local parentName = button:GetParent():GetName();
+         if ( parentName == "MultiBarBottomLeft" ) then
+             return button:GetID() + ((BOTTOMLEFT_ACTIONBAR_PAGE - 1) * 12);
+         ...
+         else
+             return button:GetID() + ((CURRENT_ACTIONBAR_PAGE - 1) * 12);
+         end
+
+     **It identifies the bar by the name of the button's parent frame.** This
+     module re-parents every action button onto a container of its own, so that
+     comparison stops matching and every multibar button falls into the last
+     branch -- where `MultiBarBottomLeftButton1`, whose `GetID` is 1, resolves
+     to action **1**: the main bar's first slot.
+
+     `ActionButton_UpdateAction` writes that into `button.action`, and
+     `MultiActionButtonUp` casts `UseAction(button.action)`. So the key presses
+     the right button, the button lights up -- the pushed state is set by the
+     *down* half and has nothing to do with any of this -- and the *up* half
+     fires somebody else's slot. Empty, usually, so nothing happens at all.
+
+     **The button is told where it came from and the client is answered with
+     that**, rather than un-doing the re-parenting. Re-parenting is what makes
+     the container's scale and alpha the bar's own, which the whole layout is
+     built on; the only thing it costs is this one lookup, so this one lookup is
+     what gets paid back.
+
+     Hooked the same way as the two passes below, and guarded on the saved
+     original for the same reason: the module table is rebuilt on a reload and
+     the function it replaced is not. ]==]
+local BAR_PAGE = {
+    MultiBarBottomLeft = "BOTTOMLEFT_ACTIONBAR_PAGE",
+    MultiBarBottomRight = "BOTTOMRIGHT_ACTIONBAR_PAGE",
+    MultiBarLeft = "LEFT_ACTIONBAR_PAGE",
+    MultiBarRight = "RIGHT_ACTIONBAR_PAGE",
+}
+
+function M:HomeBar(button)
+    if not button then return nil end
+    return button.ecoHomeBar
+end
+
+--[[ The slot a moved button would have fired from where it used to live. Nil
+     for anything this addon has not moved, which is the caller's signal to let
+     the client answer for itself. ]]--
+function M:PagedID(button)
+    local home = self:HomeBar(button)
+    if not home then return nil end
+
+    --[==[ **The bonus bar wins, exactly as it does in the client.** A druid in
+         form is looking at a different set of slots, and that test comes first
+         there -- so it comes first here, or a shapeshifted character gets the
+         unshifted answer. ]==]
+    if button.isBonus and CURRENT_ACTIONBAR_PAGE == 1 then return nil end
+
+    local page = getglobal(BAR_PAGE[home] or "")
+    if type(page) ~= "number" then return nil end
+
+    local id = button.GetID and button:GetID()
+    if type(id) ~= "number" then return nil end
+
+    local perBar = tonumber(NUM_ACTIONBAR_BUTTONS) or 12
+
+    return id + ((page - 1) * perBar)
+end
+
+function M:InstallPagedIDHook()
+    if EquadisOverhaulBlizzPagedID then return false end
+    if type(ActionButton_GetPagedID) ~= "function" then return false end
+
+    EquadisOverhaulBlizzPagedID = ActionButton_GetPagedID
+
+    ActionButton_GetPagedID = function(button)
+        local target = button or this
+
+        local mine = target and
+                EquadisClassicOverhaul.modules.actionbars:PagedID(target)
+        if mine then return mine end
+
+        return EquadisOverhaulBlizzPagedID(target)
     end
 
     return true
@@ -2504,11 +2757,7 @@ end
      and a header has no standing -- so the standing is what says which is
      which. Reading a header as a faction gives a bar with nil bounds, which
      draws as full or as empty depending on which nil is divided by which. ]==]
-function M:FactionByName(want)
-    if not want then return nil end
-    if type(GetNumFactions) ~= "function" then return nil end
-    if type(GetFactionInfo) ~= "function" then return nil end
-
+local function scanFactions(want)
     for i = 1, (GetNumFactions() or 0) do
         local name, _, standing, low, high, value = GetFactionInfo(i)
 
@@ -2518,6 +2767,101 @@ function M:FactionByName(want)
             return name, standing, low, high, value
         end
     end
+
+    return nil
+end
+
+--[==[ **Opening every header, and putting back exactly the ones that were
+     shut.**
+
+     Expanding renumbers everything below it, so this cannot walk the list and
+     carry on: it finds one collapsed header, opens it, and starts again. The
+     names go on a list in the order they were opened and are shut again in
+     reverse, by name rather than by index, because the index they had is no
+     longer the index they have.
+
+     The guard is there because the loop's exit depends on the client agreeing
+     that a header it was told to expand is now expanded. A build that does not
+     would spin forever, and a frozen client is a worse bug than a bar that is
+     one faction short. ]==]
+local function openFactionHeaders()
+    if type(ExpandFactionHeader) ~= "function" then return nil end
+
+    local opened = {}
+    local guard = 0
+    local again = true
+
+    while again and guard < 200 do
+        again = false
+        guard = guard + 1
+
+        for i = 1, (GetNumFactions() or 0) do
+            local name, _, _, _, _, _, _, _, isHeader, isCollapsed
+                    = GetFactionInfo(i)
+
+            if isHeader and isCollapsed then
+                table.insert(opened, name)
+                ExpandFactionHeader(i)
+                again = true
+                break
+            end
+        end
+    end
+
+    return opened
+end
+
+local function shutFactionHeaders(opened)
+    if not opened then return end
+    if type(CollapseFactionHeader) ~= "function" then return end
+
+    for n = table.getn(opened), 1, -1 do
+        for i = 1, (GetNumFactions() or 0) do
+            local name, _, _, _, _, _, _, _, isHeader, isCollapsed
+                    = GetFactionInfo(i)
+
+            if isHeader and not isCollapsed and name == opened[n] then
+                CollapseFactionHeader(i)
+                break
+            end
+        end
+    end
+end
+
+--[==[ **A faction under a collapsed header is not in the list at all.**
+
+     `GetNumFactions` does not answer how many factions this character has. It
+     answers **how many rows the reputation panel would draw right now** -- and
+     a shut header draws itself and none of its children. So a faction the
+     character plainly has is unreachable by index while its header is shut, and
+     a walk of the list concludes it does not exist.
+
+     That is the second half of what Ollie reported on 2026-09-24 as the
+     reputation number not updating. v0.99.326 fixed the first half, which was
+     that nothing redrew the bar. This is why the bar could still be **empty**
+     when nothing is pinned: the faction you last earned is real, it is simply
+     filed under a header somebody shut, and "follow the latest faction" had no
+     way to see it.
+
+     **The panel's own state is left exactly as it was found.** Opening headers
+     is a visible change to somebody's reputation panel, so it happens only when
+     the plain read has already failed, and every header opened is shut again.
+     A faction that was reachable all along costs nothing at all. ]==]
+function M:FactionByName(want)
+    if not want then return nil end
+    if type(GetNumFactions) ~= "function" then return nil end
+    if type(GetFactionInfo) ~= "function" then return nil end
+
+    local name, standing, low, high, value = scanFactions(want)
+    if name then return name, standing, low, high, value end
+
+    local opened = openFactionHeaders()
+    if not opened or table.getn(opened) == 0 then return nil end
+
+    name, standing, low, high, value = scanFactions(want)
+    shutFactionHeaders(opened)
+
+    if name then return name, standing, low, high, value end
 
     return nil
 end
@@ -3040,7 +3384,15 @@ function M:ShowRepTooltip(frame)
     --[[ The client's own tooltip, off the bar's right so it never covers the
          bar it is describing. ]]--
     OB.OwnTooltip(frame, "ANCHOR_RIGHT")
-    GameTooltip:AddLine(name)
+    --[==[ **`SetText` opens a tooltip; `AddLine` joins one.**
+
+         `SetOwner` does not empty a tooltip on this client and neither does
+         `Hide` -- the client's own code always follows `SetOwner` with
+         `SetText`, which is the call that drops what was there. Opening with
+         `AddLine` appended these rows to whatever was shown last, so this read
+         as the previous item's tooltip with a caption stuck on the end. Same
+         fault as the character sheet's stat rows in v0.99.320. ]==]
+    GameTooltip:SetText(name)
     if rank then GameTooltip:AddLine(rank, 1, 1, 1) end
     if progress then GameTooltip:AddLine(progress, 1, 1, 1) end
     GameTooltip:Show()
@@ -3288,7 +3640,15 @@ function M:ShowXPTooltip(frame)
     if not title then return false end
 
     OB.OwnTooltip(frame, "ANCHOR_RIGHT")
-    GameTooltip:AddLine(title)
+    --[==[ **`SetText` opens a tooltip; `AddLine` joins one.**
+
+         `SetOwner` does not empty a tooltip on this client and neither does
+         `Hide` -- the client's own code always follows `SetOwner` with
+         `SetText`, which is the call that drops what was there. Opening with
+         `AddLine` appended these rows to whatever was shown last, so this read
+         as the previous item's tooltip with a caption stuck on the end. Same
+         fault as the character sheet's stat rows in v0.99.320. ]==]
+    GameTooltip:SetText(title)
     if progress then GameTooltip:AddLine(progress, 1, 1, 1) end
     if rested then GameTooltip:AddLine(rested, 1, 1, 1) end
     GameTooltip:Show()
@@ -3950,6 +4310,11 @@ function M:OnBind()
     self:CaptureOriginals()
 
     self:RepairCameraBinding()
+
+    --[==[ **First, because the other two read `button.action`** -- and until
+         this is in place that field is whatever the client worked out from a
+         parent frame this addon had already replaced. ]==]
+    self:InstallPagedIDHook()
 
     self:InstallHotkeyHook()
     self:InstallUsableHook()

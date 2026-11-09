@@ -46,6 +46,12 @@ OB.auras = {}
      the spell. Kept beside rather than inside, because every reader of `auras`
      expects a number and a second shape there would be a rewrite of all of
      them. ]]--
+--[[ When each aura was last *seen*, as opposed to when it landed. The staleness
+     sweep reads this one; the countdown reads `OB.auras`. They were one table
+     doing both jobs, and the periodic damage lines that keep a bleed alive were
+     therefore restarting its timer on every tick. ]]--
+OB.auraSeen = {}
+
 OB.auraLengths = {}
 
 --[==[ **Some debuffs are as long as the combo points that paid for them.**
@@ -135,11 +141,198 @@ end
      a guess, and it is the only guess in this file. ]]--
 local STALE = 30
 
+--[==[ **Which rank of a spell this character knows.**
+
+     Ollie, 2026-09-29: *"rend still starting at 20. idk if its just a rend
+     issue"*. It is not just Rend -- it is every spell whose duration changes
+     with its rank.
+
+     `debuffDurations` carries them **per rank**:
+
+         ['Rend'] = { [1]=9, [2]=12, [3]=15, [4]=18, [5]=21, [6]=21, [7]=21,
+                      [0]=21 }
+
+     and `AuraTimeLeft` asked for `ranks[0]` and nothing else. Rank zero is the
+     entry for "rank unknown", and it is deliberately the **longest** -- guessing
+     short shows a timer expiring while the debuff is visibly still on. So a
+     warrior whose Rend is rank 1 was shown 21 seconds for a nine second bleed,
+     which reads as 20 the moment it ticks.
+
+     **The rank is knowable for the player's own spells**, and a debuff on your
+     target is one you put there. The spellbook answers name and rank, so the
+     highest rank of that name this character knows is the rank they cast --
+     people cast their best rank, and a lower one is a deliberate act that the
+     combat log gives no way to see.
+
+     It stays a guess for anything else: a mob's Rend on you, or a spell this
+     character does not have, still takes `ranks[0]`. That is the same answer as
+     before, for the same reason. ]==]
+function OB.PlayerSpellRank(spell)
+    if not spell then return nil end
+    if type(GetSpellName) ~= "function" then return nil end
+
+    OB.spellRanks = OB.spellRanks or {}
+    if OB.spellRanks[spell] ~= nil then
+        if OB.spellRanks[spell] == false then return nil end
+        return OB.spellRanks[spell]
+    end
+
+    local best = nil
+    local index = 1
+
+    while true do
+        local ok, name, rank = pcall(GetSpellName, index, BOOKTYPE_SPELL)
+        if not ok or not name then break end
+
+        if name == spell and type(rank) == "string" then
+            --[[ "Rank 3" -- the number is what the duration table is keyed by.
+                 A rank with no number (some client strings say "Racial") is not
+                 a rank this can use. ]]--
+            local _, _, digits = string.find(rank, "(%d+)")
+            local value = tonumber(digits)
+
+            if value and (not best or value > best) then best = value end
+        end
+
+        index = index + 1
+    end
+
+    --[[ Remembered either way: a spell this character does not have is asked
+         about on every application otherwise, and the answer never changes
+         until the spellbook does. `false` rather than nil, so "asked and there
+         is none" is not re-asked forever. ]]--
+    OB.spellRanks[spell] = best or false
+
+    return best
+end
+
+--[==[ **The duration of the rank this character actually casts**, or nothing
+     when that cannot be known.
+
+     Nothing is returned when the table has no per-rank entries, when the rank
+     is not in it, or when the rank's answer is the same as `ranks[0]` -- in all
+     three the existing fallback is already right, and writing a length down
+     when it changes nothing only adds a way to be wrong later. ]==]
+function OB.RankedDuration(spell)
+    local ranks = (OB.debuffDurations and OB.debuffDurations[spell])
+            or (OB.buffDurations and OB.buffDurations[spell])
+
+    if type(ranks) ~= "table" then return nil end
+
+    local rank = OB.PlayerSpellRank(spell)
+    if not rank then return nil end
+
+    local seconds = ranks[rank]
+    if type(seconds) ~= "number" or seconds <= 0 then return nil end
+    if seconds == ranks[0] then return nil end
+
+    return seconds
+end
+
+--[==[ **A running account of what is on whom, switched off.**
+
+     Asked for by name: *"add useful debug logging so we can verify mob name,
+     unit/GUID, spell, application time, refreshed expiration time, nameplate
+     being assigned/reassigned, removal/cleanup"*.
+
+     Off by default and costing one table lookup when it is: these calls sit on
+     the combat-log path, which is the hottest thing in the addon during a fight.
+
+     Printed rather than stored. A ring buffer would need a reader, and the
+     question this answers -- *did that refresh land, and on which mob* -- is
+     asked while looking at the screen it happened on. ]==]
+OB.auraDebug = false
+
+function OB.AuraDebug(what, unit, spell, note)
+    if not OB.auraDebug then return false end
+
+    local line = "|cffffd86b" .. tostring(what) .. "|r "
+            .. tostring(unit) .. " :: " .. tostring(spell)
+
+    local at = OB.auras[unit] and OB.auras[unit][spell]
+
+    if at then
+        local left = OB.AuraTimeLeft(unit, spell)
+        line = line .. "  applied " .. string.format("%.1f", at)
+                .. "  ends " .. (left and string.format("%.1f", GetTime() + left)
+                        or "unknown")
+                .. "  left " .. (left and string.format("%.1fs", left) or "--")
+    end
+
+    if note then line = line .. "   (" .. tostring(note) .. ")" end
+
+    OB.Raw(line)
+    return true
+end
+
 function OB.AddAura(unit, spell, texture)
     if not unit or not spell then return false end
 
     OB.auras[unit] = OB.auras[unit] or {}
-    OB.auras[unit][spell] = GetTime()
+    OB.auraSeen[unit] = OB.auraSeen[unit] or {}
+
+    local now = GetTime()
+
+    --[==[ **When it landed and when it was last seen are two different facts,
+         and this field was carrying both.**
+
+         Ollie, 2026-09-29: *"rend does restart debuff timer if reapplied"*.
+
+         ECO learns a bleed is there from its **periodic damage** lines, and
+         those arrive every three seconds for as long as it ticks. Every one of
+         them came through here and restamped the landing time -- so a nine
+         second Rend read **nine seconds, permanently**, resetting on each tick
+         and never expiring. The countdown was not slightly wrong; it never
+         counted.
+
+         One field was doing two jobs: `auras` decides the countdown, and it was
+         also what the staleness sweep reads to know the aura is still around.
+         The sweep's need is real -- nothing announces a debuff falling off a
+         unit you cannot see -- so it gets a field of its own.
+
+         **A tick is not an application.** The clock is restarted only when the
+         aura is new, or when it is demonstrably still on after its own length
+         has run out, which can only mean it was reapplied. A refresh part way
+         through cannot be told from a tick -- a damage line says the same thing
+         either way -- so that one runs to its original end and corrects itself
+         on the first tick afterwards. Better a timer that is late by one tick
+         than one that never moves. ]==]
+    --[==[ **This is an application, so it restarts the clock. Every time.**
+
+         Ollie, 2026-10-02: *"if Rend is reapplied before it expires, the actual
+         Rend duration is refreshed in-game but the addon timer is not"*, and
+         then the timer text vanishes while the bleed is plainly still on.
+
+         This used to refuse to re-stamp an aura it already knew about, on the
+         reasoning that **the line arriving here is a tick**: the module listens
+         to `CHAT_MSG_SPELL_PERIODIC_*_DAMAGE`, a bleed sends one every three
+         seconds, and treating each as an application pinned a nine second Rend
+         at nine seconds for ever.
+
+         The channel is right and the conclusion was wrong. Both sentences arrive
+         on those channels, and the only one this module *parses* is
+         `AURAADDEDOTHERHARMFUL` -- "%s is afflicted by %s." A tick line reads
+         "%s suffers %d %s damage from your %s." and cannot match it. Driven
+         through the real handler, a tick line returns nil from `ReadAuraLine`
+         and never gets here; the only lines that do are applications.
+
+         So the guard protected a path that has no ticks on it, and what it
+         actually suppressed was the refresh. **A scan** is the thing that must
+         not re-stamp, and `OB.NoteAura` above is where that belongs -- it
+         returns before reaching this function for an aura it has already seen.
+
+         The belief went unchecked for a release because the harness had no
+         `AURAADDEDOTHERHARMFUL` at all: `ReadAuraLine` begins by testing for it,
+         so the entire combat-log path was dead code in the suite and every test
+         drove this function by hand. ]==]
+    local already = OB.auras[unit][spell]
+
+    OB.auras[unit][spell] = now
+    OB.auraSeen[unit][spell] = now
+
+    OB.AuraDebug(already and "refreshed" or "applied", unit, spell,
+            already and ("was due at " .. string.format("%.1f",
+                    already + (OB.AuraDuration(unit, spell) or 0))) or nil)
 
     --[[ Worked out now rather than when somebody asks, because by then the
          combo points that decided it have been spent again on something
@@ -149,6 +342,17 @@ function OB.AddAura(unit, spell, texture)
     if points then
         OB.auraLengths[unit] = OB.auraLengths[unit] or {}
         OB.auraLengths[unit][spell] = OB.ComboDuration(spell, points)
+    else
+        --[[ **A ranked spell, at the rank this character casts.** Written down
+             here for the same reason the combo length is: it is a fact about
+             the moment the aura landed, and `AuraTimeLeft` prefers a length
+             that was recorded over one looked up. ]]--
+        local ranked = OB.RankedDuration(spell)
+
+        if ranked then
+            OB.auraLengths[unit] = OB.auraLengths[unit] or {}
+            OB.auraLengths[unit][spell] = ranked
+        end
     end
 
     --[[ The icon, learned once and kept for every unit afterwards. This is what
@@ -258,6 +462,43 @@ function OB.NoteAura(unit, spell, texture)
         --[[ Already ticking. The icon is still learned, because an icon this
              addon has not seen before is worth keeping whenever it turns up. ]]--
         if texture and OB.auraIcons then OB.auraIcons[spell] = texture end
+
+        --[==[ **Except when it is still on something our clock says it is off.**
+
+             A scan is a sighting, not an application, which is why this does not
+             re-stamp -- a pass that runs four times a second and stamps each
+             time is a timer that never counts down, and that was a real bug
+             twice.
+
+             But an aura that is *visibly still there* after its own length has
+             run out can only have been put back on. Nothing in 1.12 announces a
+             refresh that can be told apart from the first application, and
+             nothing announces one at all for a debuff somebody else applied --
+             so this sighting is the only evidence there is, and refusing to act
+             on it is how the number under the icon disappears while the debuff
+             is still on the mob.
+
+             Stamped to now rather than to when the refresh really happened,
+             which is unknowable: the answer is late by at most the scan
+             interval and generous by however long the aura had already been
+             running. Both are better than blank. A duration must be known for
+             any of this to mean anything; without one there is no "run out" to
+             detect and nothing changes. ]==]
+        local duration = OB.AuraDuration(unit, spell)
+
+        if duration and duration > 0
+                and not OB.AuraTimeLeft(unit, spell) then
+            OB.auras[unit][spell] = GetTime()
+            OB.auraSeen[unit][spell] = GetTime()
+
+            if OB.AuraDebug then
+                OB.AuraDebug("refreshed", unit, spell, "seen past its end")
+            end
+
+            return true
+        end
+
+        OB.auraSeen[unit][spell] = GetTime()
         return false
     end
 
@@ -268,8 +509,50 @@ function OB.RemoveAura(unit, spell)
     if not unit or not spell then return end
     if not OB.auras[unit] then return end
 
+    OB.AuraDebug("faded", unit, spell)
+
     OB.auras[unit][spell] = nil
+    if OB.auraSeen[unit] then OB.auraSeen[unit][spell] = nil end
     if OB.auraLengths[unit] then OB.auraLengths[unit][spell] = nil end
+end
+
+--[==[ **Everything about a unit, dropped at once -- because it died.**
+
+     Ollie, 2026-10-01, with a screenshot of a Snow Leopard wearing two debuffs
+     it never had: *"debuffs transfer to targets of the same name when the
+     original dies, it gets fixed on hover"*.
+
+     This store is keyed by **name**, and it has to be: the combat log is the
+     only source for a debuff on something that is not your target, and the
+     combat log names units. So the leopard you killed and the leopard beside it
+     are one key, and killing the first left its Rend sitting under the second's
+     name for the thirty seconds the staleness sweep allows.
+
+     Hover fixed it because a hover is a *unit token*, and an exact scan off a
+     real token overrules the guess. Away from one there is nothing to correct
+     it with -- which is why this has to be dropped at the moment of death
+     rather than waited out.
+
+     **With two of the same name alive, this forgets the survivor's debuffs
+     too.** That is the trade a name-keyed store forces, and it is the right way
+     round: a false icon says "it is already bleeding" and costs a Rend that
+     never lands, while a missing one costs one wasted global and comes straight
+     back on the next tick of a bleed that is really there. The nameplate module
+     already refuses to guess at all while two plates share a name, for the same
+     reason. ]==]
+function OB.ForgetUnitAuras(unit)
+    if not unit then return false end
+
+    local had = (OB.auras[unit] or OB.auraSeen[unit] or OB.auraLengths[unit])
+            and true or false
+
+    if had then OB.AuraDebug("forgotten", unit, "(all)", "it died") end
+
+    OB.auras[unit] = nil
+    OB.auraSeen[unit] = nil
+    OB.auraLengths[unit] = nil
+
+    return had
 end
 
 --[==[ **Base plus what was paid for it.**
@@ -317,26 +600,21 @@ end
      or one whose duration has run out, returns nothing rather than a zero or a
      guess -- a timer that says 0 on a debuff still ticking is worse than no
      timer, because it is read as fact. ]]--
-function OB.AuraTimeLeft(unit, spell)
-    if not unit or not spell then return nil end
-    if not OB.auras or not OB.auras[unit] then return nil end
-
-    local seen = OB.auras[unit][spell]
-    if not seen then return nil end
+--[==[ **How long this aura lasts**, separated out because two things need it:
+     the countdown, and deciding whether a bleed that is still ticking must have
+     been reapplied. It was inline in `AuraTimeLeft` and there was no way to ask
+     it without also asking what time it is. ]==]
+function OB.AuraDuration(unit, spell)
+    if not spell then return nil end
 
     --[==[ **A length written down when the aura landed wins.**
 
          It is the only one that can be right for a debuff whose duration was
          bought rather than fixed: the combo points that decided a Kidney Shot's
-         length are gone by the time anybody looks at the timer. ]==]
-    local bought = OB.auraLengths[unit] and OB.auraLengths[unit][spell]
-
-    if bought and bought > 0 then
-        local remaining = (seen + bought) - GetTime()
-        if remaining <= 0 then return nil end
-
-        return remaining
-    end
+         length are gone by the time anybody looks at the timer, and the rank of
+         a Rend is not in the line that announced it. ]==]
+    local bought = unit and OB.auraLengths[unit] and OB.auraLengths[unit][spell]
+    if bought and bought > 0 then return bought end
 
     --[==[ **Both tables, because a unit frame draws both lists.**
 
@@ -368,6 +646,19 @@ function OB.AuraTimeLeft(unit, spell)
     end
 
     if not duration or duration <= 0 then return nil end
+
+    return duration
+end
+
+function OB.AuraTimeLeft(unit, spell)
+    if not unit or not spell then return nil end
+    if not OB.auras or not OB.auras[unit] then return nil end
+
+    local seen = OB.auras[unit][spell]
+    if not seen then return nil end
+
+    local duration = OB.AuraDuration(unit, spell)
+    if not duration then return nil end
 
     local left = (seen + duration) - GetTime()
     if left <= 0 then return nil end
@@ -528,8 +819,14 @@ function OB.AuraList(unit, limit)
     local out = {}
 
     for spell, seen in pairs(OB.auras[unit]) do
-        if now - seen > STALE then
+        --[[ Staleness is about when it was last *seen*, not when it landed --
+             a long debuff that is still ticking is not stale. Falls back to the
+             landing time for an aura recorded before this split existed. ]]--
+        local lastSeen = (OB.auraSeen[unit] and OB.auraSeen[unit][spell]) or seen
+
+        if now - lastSeen > STALE then
             OB.auras[unit][spell] = nil
+            if OB.auraSeen[unit] then OB.auraSeen[unit][spell] = nil end
         else
             table.insert(out, {
                 spell = spell,
@@ -651,7 +948,27 @@ local EVENTS = {
          can be switched off and this is not about drawing them: it is the only
          moment the length of a finisher's debuff can be known. ]]--
     "PLAYER_COMBO_POINTS",
+
+    --[[ Which rank of a spell this character knows decides how long its debuff
+         lasts -- see `OB.PlayerSpellRank`. The answer is cached, so the cache
+         has to be dropped the moment the spellbook changes, or a freshly
+         trained rank counts down at the old rank's length for the rest of the
+         session. ]]--
+    "SPELLS_CHANGED",
+    "LEARNED_SPELL_IN_TAB",
 }
+
+--[[ A death is the only moment a name's debuffs can be known to be gone. See
+     `OB.ForgetUnitAuras`. ]]--
+for i = 1, table.getn(OB.parser.deathEvents) do
+    table.insert(EVENTS, OB.parser.deathEvents[i])
+end
+
+local DEATH_EVENT = {}
+
+for i = 1, table.getn(OB.parser.deathEvents) do
+    DEATH_EVENT[OB.parser.deathEvents[i]] = true
+end
 
 M.frame = CreateFrame("Frame", "EquadisOverhaulAuras", UIParent)
 
@@ -664,7 +981,16 @@ M.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 M.frame:SetScript("OnEvent", function()
     if event == "PLAYER_ENTERING_WORLD" then
         OB.auras = {}
+        OB.auraSeen = {}
         OB.auraLengths = {}
+        OB.spellRanks = {}
+        return
+    end
+
+    --[[ Training a new rank changes the answer, and the cached one would
+         otherwise outlive it for the rest of the session. ]]--
+    if event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB" then
+        OB.spellRanks = {}
         return
     end
 
@@ -686,6 +1012,15 @@ M.frame:SetScript("OnEvent", function()
     if event == "CHAT_MSG_SPELL_AURA_GONE_OTHER" then
         local unit, spell = M:ReadFadeLine(arg1)
         if unit then OB.RemoveAura(unit, spell) end
+        return
+    end
+
+    --[[ Something died, so whatever was on it is not on anything. Checked
+         before the aura line below because these arrive on their own channels
+         and will never parse as one. ]]--
+    if DEATH_EVENT[event] then
+        local dead = OB.ReadDeathLine(arg1)
+        if dead then OB.ForgetUnitAuras(dead) end
         return
     end
 

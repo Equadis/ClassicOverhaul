@@ -197,8 +197,29 @@ local function boot(class, powerType, opts)
          saved-variables table is included and is set again a few lines below,
          from `opts`, which is the only way a test is allowed to carry one across
          a login. ]==]
+    --[==[ **Except the shipped data tables.**
+
+         `data/` is loaded once for the whole run -- it is megabytes of literal
+         table and rebuilding it per boot was the suite's largest cost -- so
+         sweeping these away by prefix removed them for every boot after the
+         first, and nothing put them back. A reload in game re-reads those
+         files, so the swept state was one no player can be in: the addon
+         running with its own shipped data missing.
+
+         It hid a real thing. The vendor baseline is one of these, and with it
+         gone every price test since has been exercising the "nobody knows this
+         item" path while believing it tested the other one.
+
+         **Every new `data/` global has to be named here**, or it survives
+         exactly one boot and then silently is not there. The training tables
+         added on 2026-09-24 are the fourth, and they landed on this the moment
+         they were first read. ]==]
     for key in pairs(_G) do
-        if type(key) == "string" and string.find(key, "^Equadis") then
+        if type(key) == "string" and string.find(key, "^Equadis")
+                and key ~= "EquadisClassicOverhaulVendorDB"
+                and key ~= "EquadisClassicOverhaulItemDB"
+                and key ~= "EquadisClassicOverhaulLootDB"
+                and key ~= "EquadisClassicOverhaulTrainingDB" then
             _G[key] = nil
         end
     end
@@ -285,6 +306,25 @@ local function boot(class, powerType, opts)
     if Stub.BeginAddonLoad then Stub.BeginAddonLoad() end
 
     loadAddon(opts.skipFiles)
+
+    --[==[ **The shipped layout is dropped unless a test asks for it.**
+
+         `starterprofile.lua` is Ollie's own interface, captured and merged into
+         any profile that does not exist yet -- so with it in place every boot
+         here would start from his layout, and the several hundred assertions
+         below that read a *default* would be reading a deployment choice
+         instead. Forty of them failed the moment it was wired in, each one
+         correctly reporting that the code's documented default is not what the
+         shipped file says.
+
+         Those assertions are about the modules and belong to the modules. The
+         starter profile has a block of its own further down which boots with it
+         and checks that it arrives; everything else measures the code, which is
+         the same thing the capture script does and for the same reason. ]==]
+    if not opts.starterProfile then
+        EquadisClassicOverhaul.starterProfile = nil
+    end
+
     Stub.FireEvent("VARIABLES_LOADED")
     Stub.FireEvent("PLAYER_ENTERING_WORLD")
     Stub.Tick(0.05, 3)
@@ -311,7 +351,11 @@ local expected = {
     SHAMAN  = { power = 0, extras = nil,           secondary = nil },
     MAGE    = { power = 0, extras = nil,           secondary = nil },
     WARLOCK = { power = 0, extras = nil,           secondary = nil },
-    DRUID   = { power = 3, extras = "combopoints", secondary = "druidmana" },
+    --[[ **No extras bar for a druid.** Ollie, 2026-09-24: combo points are
+         "rogue only... should not show for any other class". A druid in cat
+         form does earn them, so this is a decision rather than a consequence;
+         `OB.comboClasses` in core.lua is the one place to undo it. ]]--
+    DRUID   = { power = 3, extras = nil,           secondary = "druidmana" },
 }
 
 local order = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
@@ -363,14 +407,19 @@ for i = 1, table.getn(order) do
     if not geometry then
         geometry = {}
         for id, s in pairs(slots) do
-            geometry[id] = s.x .. "," .. s.y .. "," .. s.w .. "," .. s.h
+            geometry[id] = s.w .. "," .. s.h
         end
     else
+        --[==[ **Size, not position.** Geometry is account-wide, so the
+             rectangle a mage sets is the one their warrior gets -- but the bars
+             are a stack now, and a stack's positions depend on **which bars are
+             drawn**. A druid has a mana bar a rogue does not, so the two
+             legitimately differ in `y` while sharing every setting. Comparing
+             `x` and `y` across classes would be asserting that occupancy makes
+             no difference, which is the one thing a stack changes. ]==]
         local same = true
         for id, s in pairs(slots) do
-            if geometry[id] ~= (s.x .. "," .. s.y .. "," .. s.w .. "," .. s.h) then
-                same = false
-            end
+            if geometry[id] ~= (s.w .. "," .. s.h) then same = false end
         end
         check(same, "slot geometry matches the other classes")
     end
@@ -449,11 +498,31 @@ eq(resizeSlots.resource.h, 40, "the bar really grew")
 check(clearOfEachOther(), "and the bar below was pushed clear rather than overlapped")
 check(resizeSlots.mainhand.y < belowBefore, "which means it moved")
 
--- with overlap allowed, nothing is pushed
+--[==[ **Overlap cannot be allowed any more, because it cannot happen.**
+
+     `allowOverlap` switched off a collision pass that pushed independently
+     placed bars apart. The bars are a stack now: each one's position is computed
+     from the heights above it, so there is nothing to push and nothing to
+     permit. The setting is inert, and this asserts the guarantee it used to
+     weaken. ]==]
 OB.profile.allowOverlap = true
-local untouched = resizeSlots.mainhand.y
 OB.ApplyOption(OB.optionIndex.slot.h, 24)
-eq(resizeSlots.mainhand.y, untouched, "allowing overlap leaves the others alone")
+
+local stillApart = true
+for i = 1, table.getn(OB.barOrder) do
+    for j = i + 1, table.getn(OB.barOrder) do
+        local a, b = resizeSlots[OB.barOrder[i]], resizeSlots[OB.barOrder[j]]
+        if a.show and b.show and OB.bound[OB.barOrder[i]]
+                and OB.bound[OB.barOrder[j]] then
+            if (a.y - (a.h / 2)) < (b.y + (b.h / 2))
+                    and (a.y + (a.h / 2)) > (b.y - (b.h / 2)) then
+                stillApart = false
+            end
+        end
+    end
+end
+check(stillApart, "bars cannot overlap even with the old setting switched on")
+OB.profile.allowOverlap = false
 
 -- ---------------------------------------------------------------------------
 -- 2. the rendering rules that cost real debugging time
@@ -837,8 +906,14 @@ check(not (resource.frame.spark and resource.frame.spark.shown), "the spark is h
 context = "combo points: "
 OB = boot("ROGUE", 3)
 
+--[[ In combat, because that is the only state this bar is drawn in now -- and
+     it is the state you are in whenever you have combo points to look at. The
+     out-of-combat half is asserted at the end of this block. ]]--
+Stub.FireEvent("PLAYER_REGEN_DISABLED")
+
 local combo = OB.modules.combopoints
 eq(combo.frame.count, 5, "five segments")
+check(OB.inCombat, "the player is in combat for this block")
 
 Stub.player.combo = 3
 Stub.FireEvent("PLAYER_COMBO_POINTS")
@@ -888,92 +963,470 @@ Stub.FireEvent("PLAYER_COMBO_POINTS")
 Stub.Tick(0.05, 2)
 check(combo.frame:IsShown(), "and come back when there are points to show")
 
+--[==[ **And out of combat it goes away.**
+
+     Points survive the end of a fight, so out of combat this row is reporting
+     the last pull. Asked for on 2026-09-24 alongside restricting the whole
+     feature to rogues.
+
+     `PLAYER_REGEN_ENABLED` is combat ending -- the core handler sets
+     `OB.inCombat`, and the module takes that event too so the bar goes at once
+     rather than whenever the next point happens to land. Combo points are not
+     `tickly`: nothing would redraw them otherwise, which is the fault the
+     hide-at-zero note above was written for. ]==]
+OB.profile.modules.combopoints.hideWhenZero = false
+Stub.FireEvent("PLAYER_REGEN_ENABLED")
+Stub.Tick(0.05, 2)
+check(not OB.inCombat, "leaving combat is seen")
+check(not combo.frame:IsShown(), "and the combo bar goes with it")
+
+Stub.FireEvent("PLAYER_REGEN_DISABLED")
+Stub.Tick(0.05, 2)
+check(combo.frame:IsShown(), "back in combat, back on")
+
+--[[ And it is a switch, not a rule. ]]--
+OB.profile.modules.combopoints.hideOutOfCombat = false
+Stub.FireEvent("PLAYER_REGEN_ENABLED")
+Stub.Tick(0.05, 2)
+check(combo.frame:IsShown(), "switched off, it stays out of combat")
+OB.profile.modules.combopoints.hideOutOfCombat = true
+Stub.FireEvent("PLAYER_REGEN_DISABLED")
+Stub.Tick(0.05, 2)
+
+--[==[ **And no class but a rogue has it at all.** Ollie, 2026-09-24: "rogue
+     only... should not show for any other class". A druid in cat form does
+     earn combo points and deliberately does not get this. ]==]
+eq(OB.ClassAllows(combo), true, "a rogue may run the combo bar")
+GLOBAL_comboWas = OB.class
+OB.class = "DRUID"
+eq(OB.ClassAllows(combo), false, "a druid may not, by instruction")
+eq(OB.HasComboPoints(), false, "and the nameplate asks the same question")
+OB.class = "WARRIOR"
+eq(OB.ClassAllows(combo), false, "nor anybody else")
+OB.class = GLOBAL_comboWas
+
 OB.profile.modules.combopoints.hideWhenZero = false
 
 -- ---------------------------------------------------------------------------
--- 9. movement: one code path, join, collision
+-- 9. movement: one group, one position, an order
 -- ---------------------------------------------------------------------------
 
+--[==[ **The bars are a stack now, so most of what this section used to prove no
+     longer exists.**
+
+     Ollie, 2026-09-29: *"make group omnibars together. option to move then up
+     and down between each other. make it so they cant stack at all times.
+     moveable in edit mode. dont controll x and y. just height and width."*
+
+     It used to test per-bar movement, Join, and a collision pass that refused a
+     step which would overlap. All three were mechanisms for keeping eight
+     independently placed rectangles apart. A stack has no such problem to solve:
+     every position is computed from the order and the heights above it, so
+     overlap is not prevented, it is **impossible**.
+
+     What is worth asserting changed with it -- that the group moves as one, that
+     the order is the only thing that decides who is above whom, that hidden bars
+     close the gap, and that nothing ever overlaps whatever is done to it. ]==]
 context = "movement: "
 OB = boot("ROGUE", 3)
 
 local slots = OB.profile.slots
-local startY = {}
-for id, s in pairs(slots) do startY[id] = s.y end
 
--- joined: everything moves together and keeps its spacing
-OB.profile.join = true
-OB.NudgeSlot("resource", 0, -10)
-local moved = true
-for id, s in pairs(slots) do
-    if s.y ~= startY[id] - 10 then moved = false end
+--[[ Overlap, asked directly rather than inferred. Two bars may touch; they may
+     not share a pixel. Returns the pair that does, so a failure names them. ]]--
+function GLOBAL_StackOverlap()
+    local order = OB.BarStack()
+
+    for i = 1, table.getn(order) do
+        for j = i + 1, table.getn(order) do
+            local a, b = slots[order[i]], slots[order[j]]
+
+            if a.show and b.show and OB.bound[order[i]] and OB.bound[order[j]] then
+                local aT, aB = a.y + (a.h / 2), a.y - (a.h / 2)
+                local bT, bB = b.y + (b.h / 2), b.y - (b.h / 2)
+
+                if aB < bT and aT > bB then
+                    return order[i] .. " over " .. order[j]
+                end
+            end
+        end
+    end
+
+    return nil
 end
-check(moved, "a joined nudge moves every slot by the same amount")
 
--- unjoined: only the target moves, and nothing inverts
-OB.profile.join = false
-OB.profile.allowOverlap = true
-local otherBefore = slots.health.y
-OB.NudgeSlot("resource", 5, 0)
-eq(slots.resource.x, 5, "an unjoined nudge moves the target")
-eq(slots.health.y, otherBefore, "an unjoined nudge leaves the others alone")
+eq(GLOBAL_StackOverlap(), nil, "nothing overlaps to begin with")
 
---[[ Collision, in isolation: every slot but resource and health is hidden, so
-     the only thing that can block the move is the one under test. Leaving the
-     rest of the stack in play would prove nothing -- an earlier version of this
-     test passed against the wrong bar. ]]--
-OB.profile.allowOverlap = false
-for id, s in pairs(slots) do s.show = false end
-slots.resource.show = true
-slots.health.show = true
-slots.resource.x, slots.resource.y = 0, 80
-slots.health.x, slots.health.y = 0, 55
-OB.BindSlots()
+--[==[ **A nudge moves the whole group.** There is one position, so there is one
+     thing a move can mean. Every drawn bar shifts by the same amount and the
+     spacing between them is untouched. ]==]
+GLOBAL_stackBefore = {}
+for id, s in pairs(slots) do GLOBAL_stackBefore[id] = s.y end
+GLOBAL_stackYWas = OB.profile.stackY
 
-local blockedFrom = slots.health.y
-OB.NudgeSlot("health", 0, 20)   -- straight up into the resource bar
-eq(slots.health.y, blockedFrom, "collision refuses a step that would stack bars")
+OB.NudgeSlot("resource", 0, -10)
 
--- away from the obstruction is always allowed
-OB.NudgeSlot("health", 0, -5)
-eq(slots.health.y, blockedFrom - 5, "moving away from an obstruction is allowed")
-slots.health.y = blockedFrom
+eq(OB.profile.stackY, GLOBAL_stackYWas - 10, "the group's position moves")
 
--- and a hidden slot blocks nothing
+GLOBAL_stackMoved = true
+for id, s in pairs(slots) do
+    if OB.bound[id] and s.show and s.y ~= GLOBAL_stackBefore[id] - 10 then
+        GLOBAL_stackMoved = false
+    end
+end
+check(GLOBAL_stackMoved, "and every drawn bar goes with it, keeping its spacing")
+
+--[[ Which bar was named makes no difference: they share one position. ]]--
+OB.NudgeSlot("health", 0, 10)
+eq(OB.profile.stackY, GLOBAL_stackYWas,
+        "naming a different bar moves the same group")
+
+--[==[ **Order decides who is above whom, and moving a bar re-lays the stack.**
+
+     Health ships at the top. Sending it down one must put resource above it and
+     leave every other pair in the same relation -- and it must still be true
+     that nothing overlaps. ]==]
+eq(OB.BarStack()[1], "health", "health starts at the top of the stack")
+check(slots.health.y > slots.resource.y, "and is drawn above resource")
+
+check(OB.MoveBarInStack("health", 1), "a bar can be moved down the stack")
+eq(OB.BarStack()[1], "resource", "which puts the one below it on top")
+eq(OB.BarStack()[2], "health", "and the moved bar second")
+check(slots.resource.y > slots.health.y, "and that is what is drawn")
+eq(GLOBAL_StackOverlap(), nil, "with nothing overlapping after the move")
+
+check(OB.MoveBarInStack("health", -1), "and back up again")
+eq(OB.BarStack()[1], "health", "restoring the order")
+
+--[[ The ends refuse rather than wrapping round, so a control can grey out. ]]--
+eq(OB.MoveBarInStack("health", -1), false, "the top bar cannot go higher")
+eq(OB.MoveBarInStack(OB.BarStack()[8], 1), false, "nor the bottom one lower")
+eq(OB.MoveBarInStack("nosuchbar", 1), false, "and a bar that does not exist is no move")
+
+--[==[ **A hidden bar closes the gap rather than holding it open**, which is the
+     whole point of a stack and the one thing a fixed layout could not do. ]==]
+GLOBAL_stackGapBefore = slots.mainhand.y
 slots.resource.show = false
 OB.BindSlots()
-OB.NudgeSlot("health", 0, 20)
-eq(slots.health.y, blockedFrom + 20, "a hidden slot does not block movement")
+OB.ApplyPositions()
 
-for id, s in pairs(slots) do s.show = true end
+check(slots.mainhand.y > GLOBAL_stackGapBefore,
+        "hiding a bar above moves the rest up",
+        tostring(slots.mainhand.y) .. " was " .. tostring(GLOBAL_stackGapBefore))
+eq(GLOBAL_StackOverlap(), nil, "and still nothing overlaps")
+
+--[[ And it keeps its place in the order, so switching it back on returns it to
+     where it was rather than to the bottom. ]]--
+eq(OB.BarStack()[2], "resource", "a hidden bar keeps its place in the order")
+slots.resource.show = true
 OB.BindSlots()
+OB.ApplyPositions()
+eq(slots.mainhand.y, GLOBAL_stackGapBefore, "and showing it puts the gap back")
 
---[[ **Coordinates clamp to the screen, not to the storage range.**
+--[==[ **Growing a bar cannot make it overlap the one below.**
 
-     +/-2000 is a bound on the number and says nothing about the monitor: a bar
-     dragged to 900 was saved, restored and invisible, with no way back except a
-     slider nobody would guess is the cause. That was the report.
+     This is the case the old collision pass existed for and kept missing: only
+     x and y went through it, so dragging a height slider silently overlapped the
+     neighbour while Allow Bar Overlap was off. There is no pass to miss now --
+     the bar below is placed from the one above's height. ]==]
+slots.health.h = 40
+OB.ApplyPositions()
+eq(GLOBAL_StackOverlap(), nil, "a taller bar pushes the rest down rather than over them")
+slots.health.h = 16
+OB.ApplyPositions()
 
-     The limit is half the screen less half the bar, because a bar is anchored by
-     its centre to the middle of the screen. ]]--
+--[==[ **The group clamps to the screen, by its own extent.**
+
+     +/-2000 is a bound on the number and says nothing about the monitor: a
+     layout dragged to 900 was saved, restored and invisible, with no way back
+     except a control nobody would guess is the cause. That was the report, and
+     it applies to a group exactly as it did to a bar.
+
+     What has to stay on screen is the **widest** bar and the **full height** of
+     the column, not any single bar's own rectangle. ]==]
 OB.NudgeSlot("health", 999999, 0)
 
-local edge = (GetScreenWidth() / 2) - (slots.health.w / 2)
-eq(slots.health.x, edge, "x stops at the screen's edge, not at the number's")
+local edge = (GetScreenWidth() / 2) - (OB.StackExtent() / 2)
+eq(OB.profile.stackX, edge, "x stops at the screen's edge, not at the number's")
 check(edge < OB.POS_MAX, "which is well inside the storage range")
 
---[[ The whole bar, not its centre: the right edge lands on the screen's, so
-     nothing is cut off at the limit. ]]--
-eq(slots.health.x + (slots.health.w / 2), GetScreenWidth() / 2,
-        "with the bar's far edge exactly on the screen's")
+eq(OB.profile.stackX + (OB.StackExtent() / 2), GetScreenWidth() / 2,
+        "with the widest bar's far edge exactly on the screen's")
 
 OB.NudgeSlot("health", -999999, 0)
-eq(slots.health.x, -edge, "and symmetrically on the other side")
+eq(OB.profile.stackX, -edge, "and symmetrically on the other side")
 
---[[ Taller screens allow more; the limit is read at the time, not baked in. ]]--
+--[==[ **`stackY` is a top edge, not a centre**, so its two bounds are not
+     symmetrical: the top cannot leave the top of the screen, and the bottom of
+     the column cannot leave the bottom of it. Treating it as a centre put a tall
+     stack half off screen while the controls said it was in range. ]==]
 OB.NudgeSlot("health", 0, 999999)
-eq(slots.health.y, (GetScreenHeight() / 2) - (slots.health.h / 2),
-        "y uses the screen's height and the bar's own")
+eq(OB.profile.stackY, GetScreenHeight() / 2,
+        "the top of the stack stops at the top of the screen")
+
+OB.NudgeSlot("health", 0, -999999)
+GLOBAL_stackW, GLOBAL_stackH = OB.StackExtent()
+eq(OB.profile.stackY, GLOBAL_stackH - (GetScreenHeight() / 2),
+        "and the bottom of the column stops at the bottom of it",
+        tostring(OB.profile.stackY) .. " for a column " .. tostring(GLOBAL_stackH) .. " tall")
+
+OB.profile.stackX = 0
+OB.profile.stackY = 115
+OB.ApplyPositions()
+
+--[==[ **Dragging, which nothing drove until it broke.**
+
+     Ollie, the day the stack shipped: *"omnibars dont move in editmode"*.
+     `UpdateDrag` wrote each bar's own `x` and `y` and then called
+     `ApplyPositions`, which lays the stack out and **overwrites exactly those
+     two fields**. Every drag was applied and undone inside one call, so the
+     bars sat still while the cursor moved.
+
+     The suite stayed green through it because it exercised `NudgeSlot` -- which
+     was rewired with everything else -- and never the mouse. Both paths end in
+     a position now, and both are driven here. ]==]
+OB.profile.scale = 1
+OB.ApplyScale()
+OB.profile.locked = false
+
+GLOBAL_dragFrame = OB.bound.health and OB.bound.health.frame
+check(GLOBAL_dragFrame ~= nil, "there is a bar frame to drag")
+check(OB.dragMap[GLOBAL_dragFrame] ~= nil,
+        "and the mouse is attached to it")
+
+GLOBAL_dragHealthWas = OB.profile.slots.health.y
+GLOBAL_dragResourceWas = OB.profile.slots.resource.y
+
+Stub.cursorX, Stub.cursorY = 500, 500
+OB.StartDrag(GLOBAL_dragFrame)
+
+Stub.cursorX, Stub.cursorY = 530, 460
+OB.UpdateDrag()
+
+eq(OB.profile.stackX, 30, "dragging moves the group across",
+        tostring(OB.profile.stackX))
+eq(OB.profile.stackY, 75, "and down", tostring(OB.profile.stackY))
+
+eq(OB.profile.slots.health.y, GLOBAL_dragHealthWas - 40,
+        "and the bars go with it")
+eq(OB.profile.slots.resource.y, GLOBAL_dragResourceWas - 40,
+        "all of them, keeping their spacing")
+
+--[==[ **Computed from where the drag started, not stepped.** A second update
+     without the cursor moving again must not move anything further -- stepping
+     would apply the same delta twice, which is how a long drag used to drift. ]==]
+OB.UpdateDrag()
+eq(OB.profile.stackY, 75, "a second pass with the cursor still moves nothing")
+
+--[[ And grabbing a different bar drags the same group: there is one position,
+     so it does not matter which bar the mouse is on. ]]--
+OB.StopDrag()
+Stub.cursorX, Stub.cursorY = 100, 100
+OB.StartDrag(OB.bound.resource.frame)
+Stub.cursorX, Stub.cursorY = 90, 100
+OB.UpdateDrag()
+eq(OB.profile.stackX, 20, "grabbing another bar drags the same group",
+        tostring(OB.profile.stackX))
+OB.StopDrag()
+
+--[[ Locked means locked: the whole point of the switch is that a stray click
+     on a bar cannot move the layout. ]]--
+OB.profile.locked = true
+OB.profile.stackX = 0
+OB.ApplyPositions()
+
+Stub.cursorX, Stub.cursorY = 300, 300
+OB.StartDrag(GLOBAL_dragFrame)
+Stub.cursorX, Stub.cursorY = 400, 300
+OB.UpdateDrag()
+eq(OB.profile.stackX, 0, "a locked layout does not drag")
+
+OB.profile.locked = false
+OB.StopDrag()
+OB.profile.stackX = 0
+OB.profile.stackY = 115
+OB.ApplyPositions()
+
+--[==[ **One border, round the whole column.**
+
+     Ollie, 2026-09-29: *"omni bars bar border would be around the entire unit,
+     not per bar"*. Eight stacked rectangles each in their own frame read as
+     eight widgets that happen to be touching, and the rules between them end up
+     the heaviest lines on the cluster.
+
+     Asserted on what is drawn, not on what was called. The last two faults in
+     this area -- the fontless strings and the drag that undid itself -- both
+     passed a suite that exercised the function and never looked at the
+     result. ]==]
+OB.profile.border = 3
+OB.profile.barGap = 0
+OB.BindSlots()
+OB.ApplyPositions()
+
+GLOBAL_stackEdge = getglobal("EquadisClassicOverhaulStackBorder")
+check(GLOBAL_stackEdge ~= nil, "there is a border frame for the group")
+check(GLOBAL_stackEdge:IsShown(), "and it is drawn")
+
+--[[ No bar draws one of its own any more. ]]--
+function GLOBAL_BarsWithOwnBorder()
+    local n = 0
+    for i = 1, table.getn(OB.barOrder) do
+        local m = OB.bound[OB.barOrder[i]]
+        if m and m.frame and m.frame.border and m.frame.border:IsShown() then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+eq(GLOBAL_BarsWithOwnBorder(), 0, "and no bar draws a border of its own",
+        tostring(GLOBAL_BarsWithOwnBorder()) .. " still do")
+
+--[==[ **It spans the whole column**, which is the difference between a border
+     round the group and one round the top bar. Width follows the widest bar and
+     height the full stack, both plus the art's own reach. ]==]
+GLOBAL_stackW, GLOBAL_stackH = OB.StackExtent()
+check(GLOBAL_stackH > OB.profile.slots.health.h,
+        "the column is taller than any one bar",
+        tostring(GLOBAL_stackH))
+
+check(GLOBAL_stackEdge:GetHeight() >= GLOBAL_stackH,
+        "and the border is at least as tall as the column",
+        tostring(GLOBAL_stackEdge:GetHeight()) .. " for " .. tostring(GLOBAL_stackH))
+check(GLOBAL_stackEdge:GetWidth() >= GLOBAL_stackW,
+        "and at least as wide as the widest bar",
+        tostring(GLOBAL_stackEdge:GetWidth()) .. " for " .. tostring(GLOBAL_stackW))
+
+--[==[ **It is re-sized on every pass, not built once.** The column's height
+     changes whenever a bar is resized, hidden, shown or reordered, and a border
+     that remembers the size it was built at is a rectangle round where the bars
+     used to be. ]==]
+GLOBAL_stackEdgeH = GLOBAL_stackEdge:GetHeight()
+
+OB.profile.slots.health.h = 40
+OB.ApplyPositions()
+check(GLOBAL_stackEdge:GetHeight() > GLOBAL_stackEdgeH,
+        "growing a bar grows the border with it",
+        tostring(GLOBAL_stackEdge:GetHeight()) .. " was " .. tostring(GLOBAL_stackEdgeH))
+
+OB.profile.slots.health.h = 16
+OB.ApplyPositions()
+eq(GLOBAL_stackEdge:GetHeight(), GLOBAL_stackEdgeH, "and shrinking shrinks it")
+
+OB.profile.slots.resource.show = false
+OB.BindSlots()
+OB.ApplyPositions()
+check(GLOBAL_stackEdge:GetHeight() < GLOBAL_stackEdgeH,
+        "hiding a bar takes its height out of the border too")
+
+OB.profile.slots.resource.show = true
+OB.BindSlots()
+OB.ApplyPositions()
+
+--[[ And no border style means no border, rather than an invisible frame left
+     on screen at the wrong size. ]]--
+OB.profile.border = 1
+OB.BindSlots()
+OB.ApplyPositions()
+check(not GLOBAL_stackEdge:IsShown(), "a border style of None draws nothing")
+
+OB.profile.border = 3
+OB.BindSlots()
+OB.ApplyPositions()
+check(GLOBAL_stackEdge:IsShown(), "and choosing one again brings it back")
+
+--[==[ **A bar outside the stack still draws its own.** The flag is set at bind
+     time on bars in `OB.barOrder` only, so a nameplate's or a party frame's bar
+     is untouched -- they are not part of any group and have no outer edge to
+     inherit. ]==]
+GLOBAL_looseBar = OB.CreateBar("EqOBTestLooseBar", UIParent)
+check(GLOBAL_looseBar.eqInStack == nil, "a bar built outside the stack is not flagged")
+OB.StyleBar(GLOBAL_looseBar, OB.profile.slots.health)
+check(GLOBAL_looseBar.border:IsShown(), "so it keeps a border of its own")
+
+--[==[ **A combo point keeps its own border, because the group's cannot do its
+     job.**
+
+     Ollie, 2026-09-30, with a screenshot: *"combo points are showing [im]properly
+     when border is selected"*. They were five flat blocks.
+
+     `OB.StyleSegments` styles every pip through `OB.StyleBar`, so the flag that
+     tells a bar "the group draws your edge" suppressed the border on each pip.
+     A pip's border is **not** the stack's outer edge -- it is what separates one
+     pip from the next, and one rectangle round the whole row cannot draw the
+     lines between five. Taking theirs away is not simplification, it is deleting
+     the thing that makes them read as five of anything. ]==]
+OB.profile.border = 3
+OB.profile.slots.extras.show = true
+OB.BindSlots()
+OB.ApplyPositions()
+
+GLOBAL_pips = OB.bound.extras and OB.bound.extras.frame
+check(GLOBAL_pips ~= nil, "the rogue's combo points are bound")
+check(GLOBAL_pips.bars ~= nil, "and they are drawn as segments")
+
+--[[ Styled explicitly: binding places the frames, and `StyleSegments` is what
+     puts a border on each pip. Asserting after a bind alone would be asserting
+     about frames nothing had drawn into yet. ]]--
+OB.StyleSegments(GLOBAL_pips, OB.profile.slots.extras)
+
+function GLOBAL_PipsWithBorder()
+    local n = 0
+    for i = 1, (GLOBAL_pips.count or 0) do
+        local bar = GLOBAL_pips.bars[i]
+        if bar and bar.border and bar.border:IsShown() then n = n + 1 end
+    end
+    return n
+end
+
+eq(GLOBAL_PipsWithBorder(), GLOBAL_pips.count,
+        "every pip draws a border of its own",
+        tostring(GLOBAL_PipsWithBorder()) .. " of " .. tostring(GLOBAL_pips.count))
+
+--[[ And none of them is flagged, which is the thing that went wrong: the flag
+     outlives a rebind, so a pip marked once stays marked for the session. ]]--
+function GLOBAL_PipsFlagged()
+    local n = 0
+    for i = 1, (GLOBAL_pips.count or 0) do
+        if GLOBAL_pips.bars[i] and GLOBAL_pips.bars[i].eqInStack then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+eq(GLOBAL_PipsFlagged(), 0, "and no pip is marked as the stack's own edge")
+
+--[==[ **A plain bar in the stack still has none**, which is the other half: the
+     group draws that one. The two rules are different because the shapes are
+     different, and asserting only one of them is how this shipped. ]==]
+check(OB.bound.health and OB.bound.health.frame
+        and OB.bound.health.frame.eqInStack,
+        "a plain stack bar is still marked")
+check(not (OB.bound.health.frame.border
+        and OB.bound.health.frame.border:IsShown()),
+        "and draws no border of its own")
+
+--[==[ **The mark lands on the first bind, not the second.**
+
+     It used to be set above the block that creates the frame, so on a first
+     bind there was nothing to mark -- a border that went away later, when
+     something unrelated happened to rebind. Asserted by throwing the frames
+     away and binding once. ]==]
+OB.bound.health.frame = nil
+OB.BindSlots()
+
+check(OB.bound.health and OB.bound.health.frame
+        and OB.bound.health.frame.eqInStack,
+        "a frame created during this bind is marked in the same pass")
+
+OB.profile.border = 1
+OB.BindSlots()
+OB.ApplyPositions()
+
+OB.profile.border = 1
+OB.BindSlots()
+OB.ApplyPositions()
 
 --[[ **Bar Spacing**, which the stack had no setting for at all: it was always
      edge to edge plus whatever the border needed, and there was no way to
@@ -1198,11 +1651,20 @@ eq(OB.profile.texture, 4, "texture name mapped to an index")
 eq(OB.profile.border, 2, "border name mapped to an index")
 
 eq(OB.profile.slots.extras.w, 180, "combo geometry landed on the points slot")
-eq(OB.profile.slots.extras.y, 130, "including its position")
+--[==[ **The imported arrangement becomes an order and a group position.**
+
+     RogueBars places its eight rectangles by hand. A stack has one position and
+     a list, so the import reads that arrangement back out rather than keeping
+     eight coordinates -- otherwise an import would land in this addon's default
+     order regardless of how the user had it. Combo points sat highest in the
+     fixture, so they lead the stack. ]==]
+eq(OB.BarStack()[1], "extras", "the highest imported bar leads the stack")
+eq(OB.profile.stackY, 130 + (OB.profile.slots.extras.h / 2),
+        "and the group starts at its top edge")
 eq(OB.profile.slots.extras.flip, true, "and its flip")
 eq(OB.profile.slots.resource.h, 26, "energy geometry landed on the resource slot")
-eq(OB.profile.slots.mainhand.y, 100, "main hand geometry landed on swingA")
-eq(OB.profile.slots.offhand.y, 115, "off hand geometry landed on swingB")
+eq(OB.BarStackIndex("mainhand"), 4, "main hand geometry landed on swingA")
+eq(OB.BarStackIndex("offhand"), 2, "off hand geometry landed on swingB")
 
 eq(OB.profile.modules.mainhand.decimals, 2, "main hand behaviour imported")
 eq(OB.profile.modules.mainhand.deplete, true, "including deplete")
@@ -1236,28 +1698,28 @@ context = "profiles: "
 EquadisClassicOverhaulDB = nil
 OB = boot("ROGUE", 3, { name = "Rogueone" })
 
-OB.profile.slots.resource.y = 42
+OB.profile.stackY = 42
 local db = EquadisClassicOverhaulDB
 
 -- a second character on the same profile sees the same geometry
 OB = boot("WARRIOR", 1, { name = "Warrtwo", savedVariables = db })
 eq(OB.profileName, "Default", "a new character joins the Default profile")
-eq(OB.profile.slots.resource.y, 42, "and inherits the geometry the first one set")
+eq(OB.profile.stackY, 42, "and inherits the geometry the first one set")
 
 OB.NewProfile("Raiding")
 eq(OB.profileName, "Raiding", "a new profile becomes active")
-eq(OB.profile.slots.resource.y, 42, "and starts as a copy of the current one")
+eq(OB.profile.stackY, 42, "and starts as a copy of the current one")
 
-OB.profile.slots.resource.y = 7
+OB.profile.stackY = 7
 OB.SetProfile("Default")
-eq(OB.profile.slots.resource.y, 42, "switching back restores the other profile")
+eq(OB.profile.stackY, 42, "switching back restores the other profile")
 
 OB.SetProfile("Raiding")
-eq(OB.profile.slots.resource.y, 7, "and forward again")
+eq(OB.profile.stackY, 7, "and forward again")
 
 OB.ResetProfile()
-eq(OB.profile.slots.resource.y, 86, "resetting restores this profile's defaults")
-eq(EquadisClassicOverhaulDB.profiles.Default.slots.resource.y, 42,
+eq(OB.profile.stackY, 115, "resetting restores this profile's defaults")
+eq(EquadisClassicOverhaulDB.profiles.Default.stackY, 42,
         "and leaves the other profile alone")
 
 OB.SetProfile("Default")
@@ -1320,6 +1782,117 @@ if profileDrop then
     eq(OB.profileName, "Raiding", "switching back works too")
     eq(profileDrop.selectedText, "Raiding", "and is still reported correctly")
 end
+
+-- ---------------------------------------------------------------------------
+-- 15b. and a profile nobody has written yet starts from the shipped layout
+-- ---------------------------------------------------------------------------
+
+context = "starter profile: "
+
+--[==[ **What a profile looks like before anybody has changed anything.**
+
+     Ollie, 2026-10-01: *"take the current layout, and set it as default"* --
+     *"new default profile"*, which is the name of the profile his own
+     characters use. `starterprofile.lua` is that profile, captured and shipped.
+
+     It holds **only** what departs from the defaults the modules declare, so a
+     default changed in its own file still takes effect, and a setting nobody has
+     an opinion about is absent rather than frozen. Every boot elsewhere in this
+     file drops it for that reason: those assertions are about the modules.
+
+     This block is the one that keeps it. ]==]
+EquadisClassicOverhaulDB = nil
+GLOBAL_starterOB = boot("ROGUE", 3, { starterProfile = true })
+
+check(GLOBAL_starterOB.starterProfile ~= nil, "the addon ships a starter profile")
+
+--[[ Read from the file rather than written out again here: a second copy of the
+     expected layout is a second thing to keep in step, and the capture script
+     rewrites the first one whenever Ollie moves something. ]]--
+GLOBAL_starterWant = GLOBAL_starterOB.starterProfile
+
+eq(GLOBAL_starterOB.profile.barStack[3], GLOBAL_starterWant.barStack[3],
+        "a fresh profile wears the shipped bar order",
+        tostring(GLOBAL_starterOB.profile.barStack[3]))
+eq(GLOBAL_starterOB.profile.stackY, GLOBAL_starterWant.stackY,
+        "and the shipped geometry")
+eq(GLOBAL_starterOB.profile.fontName, GLOBAL_starterWant.fontName,
+        "and the shipped font")
+
+--[==[ **A leaf arrives whole.**
+
+     `DeepMerge` replaces a leaf rather than recursing into it -- a table of
+     numbers with no tables in it, which is every colour and the bar stack
+     itself. The capture wrote only the components that differed at first, so a
+     colour arrived as `{ [2]=0, [3]=0.04 }` and the first thing to read `c[1]`
+     threw; the bar order came out missing two of its eight rows. Both are
+     exactly the shape this asserts. ]==]
+eq(table.getn(GLOBAL_starterOB.profile.barStack), 8,
+        "the bar order keeps all eight rows",
+        table.getn(GLOBAL_starterOB.profile.barStack))
+
+GLOBAL_starterColor = GLOBAL_starterOB.profile.modules.buffframes.mainHandColor
+eq(table.getn(GLOBAL_starterColor), 4, "and a colour all four of its parts",
+        table.getn(GLOBAL_starterColor))
+
+--[[ A position the defaults have nothing of at all, which is the half of the
+     capture that is written whole rather than diffed. ]]--
+check(GLOBAL_starterOB.profile.modules.unitframes.positions.PlayerFrame ~= nil,
+        "a saved frame position ships with it")
+
+--[==[ **Only where it does not disagree with a saved profile.**
+
+     The whole point is a profile that does not exist yet. Somebody who has been
+     using this addon for months has every one of these settings already, and a
+     new shipped layout arriving over the top of them would be the addon
+     rearranging their screen on an ordinary update. ]==]
+EquadisClassicOverhaulDB = nil
+GLOBAL_starterOB = boot("ROGUE", 3, { starterProfile = true })
+GLOBAL_starterOB.profile.stackY = 42
+
+GLOBAL_starterDB = EquadisClassicOverhaulDB
+GLOBAL_starterOB = boot("ROGUE", 3,
+        { starterProfile = true, savedVariables = GLOBAL_starterDB })
+
+eq(GLOBAL_starterOB.profile.stackY, 42,
+        "a profile that exists is left exactly as it was")
+
+--[==[ **And `/eq reset` lands on it**, because "the default" has to mean one
+     thing. Reset deletes the saved profile and reloads, which is the same
+     branch a fresh install comes through -- so this is the behaviour rather
+     than a second implementation of it. ]==]
+GLOBAL_starterOB.ResetProfile()
+
+eq(GLOBAL_starterOB.profile.stackY, GLOBAL_starterWant.stackY,
+        "resetting restores the shipped layout, not the bare defaults",
+        tostring(GLOBAL_starterOB.profile.stackY))
+
+--[==[ **Every module it names is a real one.**
+
+     A capture is a snapshot, and a module renamed or retired afterwards leaves
+     a branch in this file that merges into nothing for ever -- silently, because
+     a merge has no opinion about a key nobody reads. This is the one thing a
+     test can say about a file that is regenerated rather than written. ]==]
+GLOBAL_starterStrays = {}
+
+for GLOBAL_starterId in pairs(GLOBAL_starterWant.modules or {}) do
+    if not GLOBAL_starterOB.modules[GLOBAL_starterId] then
+        table.insert(GLOBAL_starterStrays, GLOBAL_starterId)
+    end
+end
+
+eq(table.getn(GLOBAL_starterStrays), 0,
+        "it names no module that no longer exists",
+        table.concat(GLOBAL_starterStrays, ", "))
+
+--[[ And it carries no schema, which is migration bookkeeping: a fresh profile
+     has to take the code's current number or every migration runs again. ]]--
+eq(GLOBAL_starterWant.schema, nil, "it carries no schema of its own")
+eq(GLOBAL_starterOB.profile.schema, GLOBAL_starterOB.defaults.schema,
+        "so a fresh profile is at the current schema")
+
+EquadisClassicOverhaulDB = nil
+OB = boot("ROGUE", 3)
 
 -- ---------------------------------------------------------------------------
 -- 16. visibility rules
@@ -1435,18 +2008,32 @@ if scale then
     near(OB.container:GetScale(), 1.5, 0.001, "and the change reaches the frame")
 end
 
--- position sliders must route through the nudge path so Join still applies
+--[==[ **The panel offers ordering, not coordinates.**
+
+     There were X and Y sliders here. A stack has one position and a list, so a
+     per-bar coordinate is a control that lies about what it does -- it would
+     write a number the next layout pass overwrites. What the page offers instead
+     is the only ordering there is, and the group is moved by dragging it in Edit
+     Mode. ]==]
 OB.panel.bar = "resource"
-OB.profile.join = true
-local ySlider = _G["EqOBSlider_slot_x_y"]
-check(ySlider ~= nil, "the Y slider exists")
-if ySlider then
-    local healthBefore = OB.profile.slots.health.y
-    local delta = 15
-    ySlider:SetValue(OB.profile.slots.resource.y + delta)
-    eq(OB.profile.slots.health.y, healthBefore + delta,
-            "a joined Y slider move takes every slot with it")
-end
+
+check(_G["EqOBSlider_slot_x_y"] == nil, "there is no per-bar Y slider any more")
+check(_G["EqOBSlider_slot_x_x"] == nil, "nor an X one")
+
+--[[ Width and height are still per bar, which is the half that survived. ]]--
+check(_G["EqOBSlider_slot_x_w"] ~= nil, "width is still a per-bar slider")
+check(_G["EqOBSlider_slot_x_h"] ~= nil, "and height")
+
+GLOBAL_panelOrderWas = OB.BarStackIndex("resource")
+check(GLOBAL_panelOrderWas ~= nil, "the selected bar is in the stack")
+
+OB.MoveBarInStack("resource", 1)
+eq(OB.BarStackIndex("resource"), GLOBAL_panelOrderWas + 1,
+        "moving it down the stack takes effect")
+
+OB.MoveBarInStack("resource", -1)
+eq(OB.BarStackIndex("resource"), GLOBAL_panelOrderWas,
+        "and moving it back up restores the order")
 
 -- every page lays out without error, on every slot, with every occupant
 try("all pages lay out for every slot", function()
@@ -1722,7 +2309,7 @@ GLOBAL_wanted = { "Home", "Modules", "Profiles",
                   "Buff Frames", "Omni Bars",
                   "Damage Meter", "Threat Meter", "UnitScan", "Tooltip",
                   "Character Panel", "Bags", "Chat", "Map", "Waypoints",
-                  "Auction House", "Item Database", "Automation" }
+                  "Auction House", "Item Database", "Misc" }
 
 --[[ Counted against the list below rather than against a number written here.
      This assertion has now drifted three times -- once when Item Database got a
@@ -2986,25 +3573,72 @@ eq(rangeBar.right.text, "[9-41y]", "and the spell range can be switched on")
 eq(rangeBar.center.text, "23y", "alongside the live one, not instead of it")
 rangeCfg.showRange = false
 
---[[ No ranged attack at all: the bar goes, whatever is targeted.
+--[==[ **No ranged attack: the bar stays, and says nothing.**
 
-     A warrior with an empty ranged slot has nothing that can be in or out of
-     range, so the question has no answer rather than a pessimistic one. It used
-     to fall back to the configured range and advertise it, which is how a warrior
-     holding no gun got told `[8-90y]` -- a confident interval describing a weapon
-     that did not exist. ]]--
-local noWeapon = boot("WARRIOR", 1, { hasTarget = true, nampower = true })
-check(noWeapon.modules.distance.spell == nil, "an empty ranged slot has no auto-attack")
-noWeapon.modules.distance.nextPoll = 0
+     Ollie, 2026-10-26: *"if rangecheck bar is enable. it should always be
+     visible even without a ranged weapon equipped."*
+
+     It used to hide outright, on the reasoning that a bar with nothing to draw
+     hides itself. That is right about the *reading* and wrong about the *bar*:
+     switching one on is a decision about the layout, and a row that vanishes
+     whenever you unequip a gun takes the rest of the stack with it.
+
+     What it must still not do is invent an answer. A warrior with an empty
+     ranged slot has nothing that can be in or out of range, and the fall-backs
+     would happily produce a green `inrange` from `ASSUMED_MAX` -- a confident
+     reading of a weapon that does not exist, which is how a warrior holding no
+     gun once got told `[8-90y]`. So the state is withheld and the bar falls to
+     its No Target colour with no text at all. ]==]
+GLOBAL_noWeapon = boot("WARRIOR", 1, { hasTarget = true, nampower = true })
+GLOBAL_noRange = GLOBAL_noWeapon.modules.distance
+
+check(GLOBAL_noRange.spell == nil, "an empty ranged slot has no auto-attack")
+GLOBAL_noRange.nextPoll = 0
 Stub.Tick(0.05, 3)
-check(not noWeapon.modules.distance.frame:IsShown(),
-        "so the bar hides rather than inventing a range")
+
+check(GLOBAL_noRange.frame:IsShown(),
+        "the bar is on screen all the same")
+
+eq(GLOBAL_noRange.state, nil, "with no state to report",
+        tostring(GLOBAL_noRange.state))
+eq(GLOBAL_noRange.frame.center.text, "", "no distance on it",
+        tostring(GLOBAL_noRange.frame.center.text))
+eq(GLOBAL_noRange.frame.right.text, "", "and no interval either",
+        tostring(GLOBAL_noRange.frame.right.text))
+
+--[[ The No Target colour, which is what "nothing to report" already looks like
+     everywhere else on this bar. ]]--
+GLOBAL_noFill = { GLOBAL_noRange.frame.fill:GetVertexColor() }
+near(GLOBAL_noFill[1], GLOBAL_noRange:Config().noTargetColor[1], 0.001,
+        "in the placeholder colour", tostring(GLOBAL_noFill[1]))
+
+--[==[ **And the one rule that still hides it is the player's own.** A No Target
+     colour with no opacity in it is somebody asking for no placeholder, and
+     that is obeyed whether the absence is a target or a weapon. ]==]
+GLOBAL_noRange:Config().noTargetColor = { 0, 0, 0, 0 }
+GLOBAL_noRange.nextPoll = 0
+
+--[[ `GLOBAL_noWeapon`, not `OB`: this block booted a warrior of its own and the
+     file-scope `OB` still points at the addon from before it. A stale table
+     here marks a module nothing is drawing dirty, and the bar then fails to change for a reason that has
+     nothing to do with the code under test. ]]--
+GLOBAL_noWeapon.SetDirty(GLOBAL_noRange)
+Stub.Tick(0.05, 3)
+
+check(not GLOBAL_noRange.frame:IsShown(),
+        "a transparent placeholder colour still takes it away")
+
+GLOBAL_noRange:Config().noTargetColor = { 0.12, 0.12, 0.12, 1 }
 
 -- a relic is the same case: paladins, shamans and druids have no ranged attack
-noWeapon = boot("PALADIN", 0, { ranged = "Librams", hasTarget = true, nampower = true })
-noWeapon.modules.distance.nextPoll = 0
+GLOBAL_noWeapon = boot("PALADIN", 0,
+        { ranged = "Librams", hasTarget = true, nampower = true })
+GLOBAL_noWeapon.modules.distance.nextPoll = 0
 Stub.Tick(0.05, 3)
-check(not noWeapon.modules.distance.frame:IsShown(), "a relic hides it too")
+
+check(GLOBAL_noWeapon.modules.distance.frame:IsShown(),
+        "a relic leaves it on screen too")
+eq(GLOBAL_noWeapon.modules.distance.state, nil, "and equally silent")
 
 --[[ No line of sight is its **own** state and its own colour.
 
@@ -3246,6 +3880,50 @@ local stateCount = 0
 for _ in pairs(statesSeen) do stateCount = stateCount + 1 end
 eq(stateCount, 4, "the preview walks every state a target can be in")
 check(statesSeen["nolos"], "including the blocked colour, which no distance produces")
+
+--[==[ **Test mode shows the cast bar too.**
+
+     Ollie, 2026-09-30: *"test mode needs to show the cast bar as well"*.
+
+     Edit mode already previewed it, because you cannot drag a bar that only
+     exists while you are casting. Test mode did not -- and it is the mode that
+     exists precisely to *look* at something: seeing a cast bar's colours, its
+     timer and its icon otherwise means finding a long spell, casting it, and
+     doing it again after every change to a setting. ]==]
+GLOBAL_uf = OB.modules.unitframes
+GLOBAL_castBar = GLOBAL_uf:CastBar("player")
+check(GLOBAL_castBar ~= nil, "there is a player cast bar")
+
+GLOBAL_uf:PreviewCastBars(false)
+check(not GLOBAL_castBar:IsShown(), "which is not shown while nothing is cast")
+
+--[[ Test mode seeds every bound bar and every *feature*; if unit frames are not
+     in that list, nothing calls their TestStart and the assertion below would be
+     about the wrong thing. ]]--
+check(OB.features and OB.features.unitframes ~= nil,
+        "unit frames are bound as a feature")
+check(type(GLOBAL_uf.TestStart) == "function", "and have a TestStart")
+
+OB.SetTestMode(true)
+check(GLOBAL_castBar:IsShown(), "test mode puts it on screen")
+check(GLOBAL_castBar.ecoPreview, "as a preview rather than as a real cast")
+
+OB.SetTestMode(false)
+check(not GLOBAL_castBar:IsShown(), "and takes it away again afterwards")
+
+--[==[ **Edit mode wins on the way out.** Leaving test mode while still
+     arranging the interface must not take the preview from under the drag
+     handles -- the bar would vanish mid-arrangement, which is the fault the
+     preview exists to avoid. ]==]
+OB.SetEditMode(true)
+OB.SetTestMode(true)
+check(GLOBAL_castBar:IsShown(), "both modes together still show it")
+
+OB.SetTestMode(false)
+check(GLOBAL_castBar:IsShown(),
+        "and leaving test mode leaves edit mode's preview alone")
+
+OB.SetEditMode(false)
 
 --[[ And then drops target for two seconds, which is the only way the fourth
      colour appears in a preview: seeing it for real means dropping target, and
@@ -3647,7 +4325,11 @@ local mainhand = OB.profile.slots.mainhand
 check(mainhand ~= nil, "swingA became mainhand")
 eq(mainhand.w, 150, "a tuned width survives")
 eq(mainhand.h, 20, "and height")
-eq(mainhand.x, 115, "and X converts to a centre: 40 + half of 150")
+--[[ The conversion is still corner-to-centre; what changed is where the answer
+     ends up. A stack has **one** X, taken from the bar that sits highest, so the
+     converted value is asserted on the group rather than on each bar. ]]--
+eq(OB.profile.stackX, OB.profile.slots.mainhand.x,
+        "every bar shares the group's X")
 eq(mainhand.textSize, 14, "and text size")
 eq(mainhand.flip, true, "and flip")
 near(mainhand.bg[1], 1, 0.001, "and background colour")
@@ -3711,9 +4393,9 @@ end
      bounded to the screen on load now, so a test coordinate off the edge would
      be corrected and read as a restack that did not happen. ]]--
 local tuned = EquadisClassicOverhaulDB
-tuned.profiles.Default.slots.health.y = 200
+tuned.profiles.Default.stackY = 208
 OB = boot("ROGUE", 3, { savedVariables = tuned })
-eq(OB.profile.slots.health.y, 200, "a current profile is not restacked again")
+eq(OB.profile.stackY, 208, "a current profile is not restacked again")
 
 --[[ The Distance bar survives the upgrade switched on.
 
@@ -3861,11 +4543,20 @@ eq(cb, 99, "top and bottom both")
 eq(cl, -100, "and is now centred horizontally")
 eq(cr, 100, "half its width each side of zero")
 
+--[==[ **A stack has one X, so bars that were at different X values converge.**
+
+     That is inherent to grouping them: "make group omnibars together" and "each
+     bar keeps its own horizontal position" cannot both be true. The conversion
+     itself is unchanged and is asserted above; what is asserted here is that the
+     group took the value from the bar that leads the stack, rather than
+     inventing one. ]==]
 local moved = OB.profile.slots.resource
-eq(moved.x, 115, "a bar somebody positioned converts instead")
-local ml, mr, mt = OB.EdgesOf(moved)
-eq(ml, 40, "so its left edge is exactly where they left it")
-eq(mt, 98, "and its top")
+eq(moved.x, OB.profile.stackX, "a positioned bar converges on the group's X")
+eq(OB.profile.stackX, OB.profile.slots[OB.BarStack()[1]].x,
+        "which is the one the leading bar converted to")
+--[[ Its top edge, which the stack decides from the order rather than from the
+     converted Y. Read afresh rather than from the removed EdgesOf call. ]]--
+eq(select(3, OB.EdgesOf(moved)), moved.y + (moved.h / 2), "and its top")
 
 -- every shipped default is centred
 EquadisClassicOverhaulDB = nil
@@ -5817,7 +6508,7 @@ check(not hasGeneralTab, "and General is no longer a tab of its own")
 --[==[ Automation last, because it is the only page whose settings do
      something while nobody is looking at them. Modules used to be last, from
      when it was the shortest question rather than the second one. ]==]
-eq(order[table.getn(order)], "Automation", "and Automation is last")
+eq(order[table.getn(order)], "Misc", "and Misc is last")
 
 local hasTab = {}
 for i = 1, table.getn(order) do hasTab[order[i]] = true end
@@ -13053,6 +13744,383 @@ qol:ApplyCamera()
 eq(Stub.cvars.cameraYawMoveSpeed, "360",
         "switching off stops changing it rather than guessing what it was")
 
+--[==[ **Fine camera zoom**, absorbed from FineZoom by Stormhand (MIT).
+
+     Ollie, 2026-09-30: *"port over everything from finezoom addon into camera in
+     'automation'"*.
+
+     1.12 exposes no zoom-*speed* CVar: the mouse wheel moves the camera one
+     fixed jump and nothing in Lua changes that. What it does expose is
+     `CameraZoomIn(step)` -- so the way to a finer step is a **binding of your
+     own** that calls it with a number, and the wheel rebound onto that binding.
+     That is upstream's whole idea and it is what was ported. ]==]
+eq(cfg.zoomStep, 0.2, "the shipped step is upstream's fifth of a notch")
+
+Stub.cameraZooms = {}
+Stub.cameraZoom = 0
+
+eq(qol:FineZoom(false), 0.2, "zooming in uses the step")
+eq(Stub.cameraZoom, -0.2, "and moves the camera closer")
+
+eq(qol:FineZoom(true), 0.2, "zooming out uses the same step")
+eq(Stub.cameraZoom, 0, "and back out again")
+
+eq(table.getn(Stub.cameraZooms), 2, "one client call each, not two")
+eq(Stub.cameraZooms[1].dir, "in", "in first")
+eq(Stub.cameraZooms[2].dir, "out", "then out")
+
+--[==[ **The clamp is upstream's and the reasons are good ones**: below a
+     twentieth a press does nothing you can see, and above five there is no
+     point having the feature at all. A number outside that is a mistake
+     somewhere else and must not reach the client. ]==]
+cfg.zoomStep = 0.001
+eq(qol:ZoomStep(), 0.05, "a step under the floor is lifted to it")
+
+cfg.zoomStep = 99
+eq(qol:ZoomStep(), 5, "and one over the ceiling is brought down")
+
+cfg.zoomStep = "not a number"
+eq(qol:ZoomStep(), 0.2, "and something that is not a number falls back")
+
+cfg.zoomStep = 0.5
+eq(qol:FineZoom(false), 0.5, "a step somebody chose is used as chosen")
+
+--[==[ **Binding the wheel**, which upstream offered as `/fzbind` and is the one
+     thing nobody wants to do twice.
+
+     `SetBinding` alone lasts until the next reload -- the half plenty of addons
+     get wrong, so somebody "fixes" their bindings every session and never works
+     out why they come back. Saved to the client's own set. ]==]
+Stub.boundTo = {}
+check(not qol:WheelIsFineZoom(), "the wheel is not fine zoom to begin with")
+
+check(qol:BindWheelToFineZoom(), "the wheel can be bound to it")
+eq(Stub.boundTo["MOUSEWHEELUP"], "EQUADISOVERHAULZOOMIN",
+        "up zooms in", tostring(Stub.boundTo["MOUSEWHEELUP"]))
+eq(Stub.boundTo["MOUSEWHEELDOWN"], "EQUADISOVERHAULZOOMOUT",
+        "and down zooms out")
+
+check(qol:WheelIsFineZoom(), "which it then reports")
+
+--[[ Half-bound is not bound: a wheel with one of the two on something else
+     would zoom one way and do something unrelated the other. ]]--
+Stub.boundTo["MOUSEWHEELDOWN"] = "TOGGLEWORLDMAP"
+check(not qol:WheelIsFineZoom(), "one of the two on something else is not bound")
+
+--[==[ **The names the client's Key Bindings screen shows.** A binding with no
+     name is a blank row in that list, which is how somebody loses a feature
+     they have already been given. ]==]
+eq(BINDING_HEADER_EQUADISOVERHAULCAMERA, "Equadis' Overhaul: Camera",
+        "the bindings have a heading of their own")
+eq(BINDING_NAME_EQUADISOVERHAULZOOMIN, "Fine Zoom In", "and a name each")
+eq(BINDING_NAME_EQUADISOVERHAULZOOMOUT, "Fine Zoom Out", "both of them")
+
+--[==[ **A key left pointing at an addon that is no longer there.**
+
+     Ollie, 2026-10-14, having switched the standalone FineZoom off as this
+     addon's conflict warning asks: *"finezoom disable scroll wheel no longer
+     works, cant zoom, camera speed seems okay"*.
+
+     His `bindings-cache.wtf` holds the answer in two lines --
+
+         bind MOUSEWHEELUP FINEZOOMIN
+         bind MOUSEWHEELDOWN FINEZOOMOUT
+
+     -- and `FINEZOOMIN` is a binding **FineZoom declares**. Disable it and the
+     command stops existing while the saved binding goes on naming it, so the
+     wheel is bound to nothing at all. Not coarse zoom: no zoom. Camera speed
+     was fine because that is a CVar and nothing had rebound it.
+
+     ECO absorbed that feature and told him to switch the addon off, so the keys
+     left pointing at it are its to inherit. ]==]
+Stub.boundTo = {}
+Stub.bindings = {}
+Stub.loadedAddons = Stub.loadedAddons or {}
+Stub.loadedAddons["FineZoom"] = nil
+
+--  what his cache actually holds
+Stub.boundTo["MOUSEWHEELUP"] = "FINEZOOMIN"
+Stub.boundTo["MOUSEWHEELDOWN"] = "FINEZOOMOUT"
+Stub.bindings["FINEZOOMIN"] = "MOUSEWHEELUP"
+Stub.bindings["FINEZOOMOUT"] = "MOUSEWHEELDOWN"
+
+check(not qol:WheelIsFineZoom(),
+        "the wheel points at a command the client no longer has")
+
+GLOBAL_bindSavesBefore = Stub.bindingsSaved
+
+eq(OB.InheritOrphanedBindings(), 2, "both orphaned keys are taken over",
+        tostring(OB.InheritOrphanedBindings and "ran" or "missing"))
+
+eq(Stub.boundTo["MOUSEWHEELUP"], "EQUADISOVERHAULZOOMIN",
+        "up zooms in again", tostring(Stub.boundTo["MOUSEWHEELUP"]))
+eq(Stub.boundTo["MOUSEWHEELDOWN"], "EQUADISOVERHAULZOOMOUT",
+        "and down zooms out")
+
+check(qol:WheelIsFineZoom(), "so the wheel is on fine zoom")
+
+--[[ Saved to the client's own set, or it comes back dead on the next login --
+     which is the half that would make this look like it had not worked. ]]--
+check(Stub.bindingsSaved > GLOBAL_bindSavesBefore,
+        "and written to the client's binding set")
+
+--[==[ **Only while the addon is actually gone.** An addon that is loaded still
+     owns its own bindings, and re-enabling it has to hand them straight back
+     rather than leaving ECO squatting on its keys. ]==]
+Stub.boundTo = {}
+Stub.bindings = {}
+Stub.boundTo["MOUSEWHEELUP"] = "FINEZOOMIN"
+Stub.bindings["FINEZOOMIN"] = "MOUSEWHEELUP"
+Stub.loadedAddons["FineZoom"] = 1
+
+eq(OB.InheritOrphanedBindings(), 0, "a loaded addon keeps its keys")
+eq(Stub.boundTo["MOUSEWHEELUP"], "FINEZOOMIN", "exactly as they were")
+
+Stub.loadedAddons["FineZoom"] = nil
+
+--[==[ **And nothing else is touched.** The command has to be the dead one,
+     character for character -- a wheel somebody has deliberately put on
+     something of their own is not a repair opportunity. ]==]
+Stub.boundTo = {}
+Stub.bindings = {}
+Stub.boundTo["MOUSEWHEELUP"] = "TOGGLEWORLDMAP"
+Stub.bindings["TOGGLEWORLDMAP"] = "MOUSEWHEELUP"
+
+eq(OB.InheritOrphanedBindings(), 0, "a key bound to something live is left alone")
+eq(Stub.boundTo["MOUSEWHEELUP"], "TOGGLEWORLDMAP", "and keeps what it had")
+
+--[[ Nor is a wheel that is simply unbound claimed: there is no orphan there,
+     only somebody who has not asked for fine zoom. ]]--
+Stub.boundTo = {}
+Stub.bindings = {}
+eq(OB.InheritOrphanedBindings(), 0, "an unbound wheel is not claimed either")
+
+--[==[ **And login is what calls it**, which is the half worth more than all of
+     the above.
+
+     A repair nothing runs is a repair that did not happen, and this addon has
+     shipped that shape before -- a recovery path written, commented and
+     unreachable. `PLAYER_ENTERING_WORLD` is the moment `IsAddOnLoaded` can
+     answer completely, which is the same reason the conflict warning waits for
+     it; and like that warning it runs once, because the event fires again on
+     every loading screen. ]==]
+Stub.boundTo = {}
+Stub.bindings = {}
+Stub.boundTo["MOUSEWHEELUP"] = "FINEZOOMIN"
+Stub.bindings["FINEZOOMIN"] = "MOUSEWHEELUP"
+
+OB.bindingsInherited = nil
+Stub.FireEvent("PLAYER_ENTERING_WORLD")
+
+eq(Stub.boundTo["MOUSEWHEELUP"], "EQUADISOVERHAULZOOMIN",
+        "logging in repairs the wheel without being asked",
+        tostring(Stub.boundTo["MOUSEWHEELUP"]))
+
+--[[ Once. A second loading screen must not re-announce a repair it has already
+     done. ]]--
+Stub.boundTo["MOUSEWHEELUP"] = "FINEZOOMIN"
+Stub.bindings["FINEZOOMIN"] = "MOUSEWHEELUP"
+Stub.FireEvent("PLAYER_ENTERING_WORLD")
+
+eq(Stub.boundTo["MOUSEWHEELUP"], "FINEZOOMIN",
+        "and does not run again on the next loading screen")
+
+cfg.zoomStep = 0.2
+Stub.boundTo = {}
+Stub.bindings = {}
+
+--[==[ **FineZoom's settings, copied across** -- Ollie, 2026-10-26: *"port
+     exactly over how finezoom works. copy commands, but turn into sliders."*
+     and then *"copy finezoom settings over"*.
+
+     His FineZoom step was 2 on one account and 0.2 on the other; this addon's
+     slider said 0.2 on both, so the wheel changed behaviour the day he followed
+     the conflict warning and switched FineZoom off.
+
+     A block in a function of its own: the main chunk of this file is at Lua's
+     200-local ceiling. ]==]
+function GLOBAL_FineZoomImportTest()
+    local function store()
+        return { version = 2, migrated = {}, profiles = {
+            Main = { modules = { qol = { zoomStep = 0.2 } } },
+            Alt = { modules = { qol = { zoomStep = 0.2 } } },
+            Chosen = { modules = { qol = { zoomStep = 0.5 } } },
+            Unset = { modules = { qol = {} } },
+            Bare = { modules = {} },
+        } }
+    end
+
+    FineZoomStep = nil
+    local db = store()
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 0.2,
+            "with FineZoom not loaded there is nothing to copy")
+    check(not db.migrated.fineZoomStep,
+            "and the import is left for a login that has it, not used up")
+
+    FineZoomStep = "two"
+    OB.RunDBMigrations(db)
+    check(not db.migrated.fineZoomStep, "a value that is not a number is not used up either")
+
+    --[[ His step on the account that tuned it. ]]--
+    FineZoomStep = 2
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 2, "a profile on the shipped step takes his")
+    eq(db.profiles.Alt.modules.qol.zoomStep, 2, "and so does every other one: the store is account-wide")
+    eq(db.profiles.Unset.modules.qol.zoomStep, 2, "one that never wrote the setting too")
+    eq(db.profiles.Chosen.modules.qol.zoomStep, 0.5,
+            "a step somebody chose here afterwards is theirs and is left alone")
+    eq(db.profiles.Bare.modules.qol, nil,
+            "a profile with no camera settings is not given a table it never had")
+    check(db.migrated.fineZoomStep, "and the import is marked as done")
+
+    --[[ Once. A later change of the step, or of the old addon's, is not a reason
+         to overwrite what somebody has set since. ]]--
+    db.profiles.Main.modules.qol.zoomStep = 1.25
+    FineZoomStep = 4
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 1.25, "a second run changes nothing")
+
+    --[[ The other account: his step there is the shipped one, so nothing moves
+         but the import is still counted. ]]--
+    FineZoomStep = 0.2
+    db = store()
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 0.2, "a step that is already the default changes nothing")
+    check(db.migrated.fineZoomStep, "but there was a number, so it is done")
+
+    --[[ Upstream's own limits, so a hand-edited saved variable never reaches the
+         client as a number it should not see. ]]--
+    FineZoomStep = 99
+    db = store()
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 5, "above the ceiling it is brought down")
+
+    FineZoomStep = 0.001
+    db = store()
+    OB.RunDBMigrations(db)
+    eq(db.profiles.Main.modules.qol.zoomStep, 0.05, "below the floor it is lifted")
+
+    FineZoomStep = nil
+end
+
+GLOBAL_FineZoomImportTest()
+
+--[==[ **And its two commands, which are the same controls.**
+
+     `/finezoom <step>` is the slider's value and `/fzbind` is the button, so
+     typing one and using the other cannot disagree. ]==]
+function GLOBAL_FineZoomCommandsTest()
+    local qol = OB.modules.qol
+    local cfg = qol:Config()
+
+    local function said(text)
+        for i = 1, table.getn(Stub.chat) do
+            if string.find(Stub.chat[i], text, 1, true) then return true end
+        end
+        return false
+    end
+
+    cfg.zoomStep = 0.2
+    Stub.loadedAddons = Stub.loadedAddons or {}
+    Stub.boundTo = {}
+    Stub.bindings = {}
+
+    --[[ The standalone, still switched on, has registered its own handler and
+         will have done so after this addon loaded. ]]--
+    Stub.loadedAddons["FineZoom"] = 1
+    GLOBAL_standaloneRan = false
+    SLASH_FINEZOOM1 = "/finezoom"
+    SlashCmdList["FINEZOOM"] = function() GLOBAL_standaloneRan = true end
+    SLASH_FINEZOOMBIND1 = "/fzbind"
+    SlashCmdList["FINEZOOMBIND"] = function() GLOBAL_standaloneRan = true end
+    FineZoomStep = 0.2
+
+    OB.fineZoomCommands = nil
+    eq(OB.InstallFineZoomCommands(), 2, "both commands are taken over from the standalone")
+    eq(SLASH_FINEZOOM1, "/finezoom", "under the same word")
+    eq(SLASH_FINEZOOMBIND1, "/fzbind", "both of them")
+
+    Stub.chat = {}
+    SlashCmdList["FINEZOOM"]("0.3")
+    check(not GLOBAL_standaloneRan, "so the standalone's handler no longer answers")
+    eq(cfg.zoomStep, 0.3, "/finezoom 0.3 sets the slider's value")
+    eq(qol:ZoomStep(), 0.3, "which is the step the zoom bindings use")
+    check(said("zoom step set to 0.30"), "and says so in upstream's words")
+    eq(FineZoomStep, 0.3, "and the standalone's own saved step follows, so they never disagree")
+
+    SlashCmdList["FINEZOOM"]("0,45")
+    eq(cfg.zoomStep, 0.45, "a comma is a decimal point, as upstream allows")
+
+    SlashCmdList["FINEZOOM"]("9")
+    eq(cfg.zoomStep, 5, "above the ceiling it is brought down to it")
+
+    SlashCmdList["FINEZOOM"]("0.001")
+    eq(cfg.zoomStep, 0.05, "below the floor it is lifted to it")
+
+    SlashCmdList["FINEZOOM"]("1.25")
+    Stub.chat = {}
+    SlashCmdList["FINEZOOM"]("fast")
+    eq(cfg.zoomStep, 1.25, "a word that is not a number changes nothing")
+    check(said("Usage: /finezoom <step>"), "and prints the usage line")
+    check(said("Now 1.25"), "with the step it is on now")
+
+    Stub.chat = {}
+    SlashCmdList["FINEZOOM"]("")
+    check(said("Usage: /finezoom <step>"), "typed alone it says how to use it too")
+    eq(cfg.zoomStep, 1.25, "and changes nothing")
+
+    --[[ The slider's own range reaches everything the command can set. ]]--
+    SlashCmdList["FINEZOOM"]("0.05")
+    eq(cfg.zoomStep, 0.05, "the smallest step is reachable")
+
+    Stub.boundTo = {}
+    Stub.chat = {}
+    SlashCmdList["FINEZOOMBIND"]("")
+    eq(Stub.boundTo["MOUSEWHEELUP"], "EQUADISOVERHAULZOOMIN", "/fzbind puts the wheel up on fine zoom in")
+    eq(Stub.boundTo["MOUSEWHEELDOWN"], "EQUADISOVERHAULZOOMOUT", "and down on fine zoom out")
+    check(qol:WheelIsFineZoom(), "which is what the button reports")
+
+    --[[ **Taken over from the standalone, never from anybody else.** ]]--
+    Stub.loadedAddons["FineZoom"] = nil
+    GLOBAL_otherRan = false
+    local theirs = function() GLOBAL_otherRan = true end
+    SlashCmdList["FINEZOOM"] = theirs
+    SLASH_FINEZOOM1 = "/finezoom"
+    SlashCmdList["FINEZOOMBIND"] = nil
+    SLASH_FINEZOOMBIND1 = nil
+
+    OB.fineZoomCommands = nil
+    eq(OB.InstallFineZoomCommands(), 1,
+            "with the standalone gone, a word something else answers to is left alone")
+    eq(SlashCmdList["FINEZOOM"], theirs, "and its handler is untouched")
+    eq(SlashCmdList["FINEZOOMBIND"] ~= nil, true, "while the free one is registered")
+
+    --[[ And with nothing in the way at all, both are simply there. ]]--
+    SlashCmdList["FINEZOOM"] = nil
+    SLASH_FINEZOOM1 = nil
+    SlashCmdList["FINEZOOMBIND"] = nil
+    SLASH_FINEZOOMBIND1 = nil
+    OB.fineZoomCommands = nil
+    eq(OB.InstallFineZoomCommands(), 2, "with the standalone gone and nobody else, both are ours")
+
+    --[[ **Login is what runs it**, for the reason the binding repair is tested
+         the same way: a repair nothing calls has not happened. ]]--
+    SlashCmdList["FINEZOOM"] = nil
+    SLASH_FINEZOOM1 = nil
+    OB.fineZoomCommands = nil
+    Stub.FireEvent("PLAYER_ENTERING_WORLD")
+    check(SlashCmdList["FINEZOOM"] ~= nil, "logging in registers /finezoom without being asked")
+    eq(OB.fineZoomCommands, true, "once")
+
+    FineZoomStep = nil
+    cfg.zoomStep = 0.2
+    Stub.boundTo = {}
+    Stub.bindings = {}
+end
+
+GLOBAL_FineZoomCommandsTest()
+
 -- ---------------------------------------------------------------------------
 -- vendors
 -- ---------------------------------------------------------------------------
@@ -14126,6 +15194,17 @@ Stub.sold = {}
 
      So the store learns. A vendor price seen once is true forever, and it is
      account-wide, which turns "only at a vendor" into "at a vendor, once, ever". ]]--
+--[==[ **Ids the shipped baseline does not know**, which is what this block
+     is about: not knowing. The fixtures used to be given whatever id the stub
+     handed out next, and those landed on real ids -- so once the vendor
+     baseline grew to fifteen thousand items, "nothing is known about this
+     grey" became false and four tests here failed. They were right to: the
+     junk rule reads the static baseline as its second source, by design, so
+     a fixture that wants the *unknown* path has to be genuinely unknown. ]==]
+Stub.itemIds["Broken Fang"] = 990001
+Stub.itemIds["Chipped Claw"] = 990002
+Stub.itemIds["Linen Cloth"] = 990003
+
 Stub.SetBag(0, {
     { name = "Broken Fang", quality = 0, price = 250 },
     { name = "Chipped Claw", quality = 0, price = 4000 },
@@ -14509,6 +15588,212 @@ eq(qol:AutoRollChoice(1), 1, "what is on the need list is needed")
 
 qol:RemoveAutoRollItem("need", "Black Lotus")
 eq(qol:AutoRollChoice(1), nil, "and once removed, nothing is chosen for it")
+
+-- ---------------------------------------------------------------------------
+-- and the settings box adds one name at a time
+-- ---------------------------------------------------------------------------
+
+--[==[ **A box holding a whole list has a ceiling, and Ollie reached it.**
+
+     2026-11-08: *"enter the name then click enter to add to list. we reach a ch
+     limit and its hard to do"*.
+
+     These were one edit box carrying the entire comma-separated string, capped
+     by `SetMaxLetters` at 250 -- past which the list could not be edited at
+     all. Typing one name and pressing Enter has no ceiling, because the stored
+     string is never the thing being typed into.
+
+     Driven through the real widget. Nothing in this file had ever opened an
+     input row and pressed a key in it, so the whole `addInput` path -- commit,
+     escape, the refresh guard -- was built and never once exercised. ]==]
+OB.TogglePanel()
+
+EquadisClassicOverhaulDB.autoNeed = ""
+EquadisClassicOverhaulDB.autoGreed = ""
+
+--[[ Found by walking the panel rather than by spelling its frame name: the
+     name is built from the row's scope, module and key, and guessing it is a
+     test that breaks when any of those is renamed. ]]--
+GLOBAL_addBox, GLOBAL_greedBox = nil, nil
+
+for GLOBAL_k, GLOBAL_widget in pairs(OB.widgets or {}) do
+    local row = GLOBAL_widget and GLOBAL_widget.w
+    if row and row.key == "__a_need" then GLOBAL_addBox = GLOBAL_widget end
+    if row and row.key == "__a_greed" then GLOBAL_greedBox = GLOBAL_widget end
+end
+
+check(GLOBAL_addBox ~= nil, "the Need page has a box to type a name into",
+        tostring(GLOBAL_addBox))
+
+--[[ It shows nothing: what it would display is the list, and the list is drawn
+     underneath it a row at a time. ]]--
+GLOBAL_addBox:Update()
+eq(GLOBAL_addBox:GetText(), "", "which starts empty rather than holding the list")
+
+GLOBAL_thisWas = this
+GLOBAL_addBox:SetText("Zulian Coin")
+this = GLOBAL_addBox
+GLOBAL_addBox.scripts.OnEnterPressed()
+this = GLOBAL_thisWas
+
+check(qol:OnAutoRollList("need", "Zulian Coin"),
+        "pressing Enter adds what was typed")
+eq(GLOBAL_addBox:GetText(), "",
+        "and empties the box, ready for the next one",
+        tostring(GLOBAL_addBox:GetText()))
+
+--[[ A second name goes on beside the first rather than over it, which is the
+     whole difference from the box this replaced. ]]--
+GLOBAL_addBox:SetText("Sandfury Coin")
+this = GLOBAL_addBox
+GLOBAL_addBox.scripts.OnEnterPressed()
+this = GLOBAL_thisWas
+
+eq(table.getn(qol:AutoRollEntries("need")), 2, "a second name joins the first",
+        table.concat(qol:AutoRollEntries("need"), ", "))
+
+--[==[ **Clicking away does not add.** The field version of this box writes on
+     focus loss, which is right for a value being edited and wrong here: it
+     would add whatever half-typed fragment was sitting there. ]==]
+GLOBAL_addBox:SetText("Half Typed Na")
+this = GLOBAL_addBox
+GLOBAL_addBox.scripts.OnEditFocusLost()
+this = GLOBAL_thisWas
+
+eq(table.getn(qol:AutoRollEntries("need")), 2,
+        "losing focus with something half-typed adds nothing",
+        table.concat(qol:AutoRollEntries("need"), ", "))
+
+--[[ And an empty box adds nothing at all rather than an empty entry. ]]--
+GLOBAL_addBox:SetText("")
+this = GLOBAL_addBox
+GLOBAL_addBox.scripts.OnEnterPressed()
+this = GLOBAL_thisWas
+
+eq(table.getn(qol:AutoRollEntries("need")), 2, "nor does Enter on an empty box")
+
+--[[ The Greed page has its own, writing to its own list. ]]--
+check(GLOBAL_greedBox ~= nil, "and Greed has one of its own")
+
+GLOBAL_greedBox:SetText("Hakkari Bijou")
+this = GLOBAL_greedBox
+GLOBAL_greedBox.scripts.OnEnterPressed()
+this = GLOBAL_thisWas
+
+check(qol:OnAutoRollList("greed", "Hakkari Bijou"), "which adds to Greed")
+check(not qol:OnAutoRollList("need", "Hakkari Bijou"), "and not to Need")
+
+EquadisClassicOverhaulDB.autoNeed = ""
+EquadisClassicOverhaulDB.autoGreed = ""
+OB.TogglePanel()
+
+-- ---------------------------------------------------------------------------
+-- right-click the dice to put the item on a list
+-- ---------------------------------------------------------------------------
+
+--[==[ **The lists were typed by hand, and the item is right in front of you.**
+
+     Ollie, 2026-11-08: *"auto loot rolls add ability to right click need/greed
+     then select add to list"*.
+
+     Reading an item's name off a roll window that is counting down and then
+     spelling it into a settings box is the gesture this removes. A menu rather
+     than a bare right-click action, because what you often want from the Need
+     button is for this to always be a *Greed*.
+
+     The client's own button names, out of
+     `Interface\FrameXML\LootFrame.xml`: Need is `$parentRollButton`, and
+     nothing is called NeedButton. ]==]
+EquadisClassicOverhaulDB.autoNeed = ""
+EquadisClassicOverhaulDB.autoGreed = ""
+
+Stub.lootRolls[9] = { name = "Zulian Coin", count = 1, quality = 2 }
+Stub.ShowLootRoll(1, 9)
+
+GLOBAL_needBtn = getglobal("GroupLootFrame1RollButton")
+GLOBAL_greedBtn = getglobal("GroupLootFrame1GreedButton")
+
+check(GLOBAL_needBtn ~= nil and GLOBAL_greedBtn ~= nil,
+        "the roll window has its Need and Greed buttons")
+
+eq(qol:InstallRollButtons(), 0,
+        "they are hooked at login, not on the first click",
+        tostring(qol:InstallRollButtons()))
+
+--[==[ **Hooked once.** The module table is rebuilt on every load and the frames
+     are not, so a boolean saying "done" outlives the hook it describes and a
+     reload stacks a second wrapper on the first. Recognised by the wrapper. ]==]
+check(GLOBAL_needBtn.ecoRollWrapper ~= nil, "by a wrapper it can recognise again")
+
+--[==[ **A left click still rolls**, because that is the gesture everybody
+     already knows and nothing is being taken from them. ]==]
+Stub.rolledOnLoot = {}
+GLOBAL_thisWas = this
+this, arg1 = GLOBAL_needBtn, "LeftButton"
+GLOBAL_needBtn.scripts.OnClick()
+this, arg1 = GLOBAL_thisWas, nil
+
+GLOBAL_rolledNow = Stub.rolledOnLoot[1]
+eq(GLOBAL_rolledNow and GLOBAL_rolledNow.id, 9,
+        "left-clicking Need still rolls on it",
+        tostring(GLOBAL_rolledNow and GLOBAL_rolledNow.id))
+eq(GLOBAL_rolledNow and GLOBAL_rolledNow.rollType, 1, "and rolls Need")
+
+--[==[ **A right click does not roll.** Putting an item on a list and rolling on
+     this one are different intentions, and doing both would make the menu
+     something you cannot open without committing. ]==]
+Stub.rolledOnLoot = {}
+this, arg1 = GLOBAL_needBtn, "RightButton"
+GLOBAL_needBtn.scripts.OnClick()
+this, arg1 = GLOBAL_thisWas, nil
+
+eq(table.getn(Stub.rolledOnLoot), 0, "right-clicking it does not roll")
+
+--[[ What the menu offers for that item. Read directly rather than through the
+     dropdown, the same split the waypoint menu uses. ]]--
+GLOBAL_rollMenu = qol:RollMenuItems("Zulian Coin")
+
+eq(GLOBAL_rollMenu[1].text, "Zulian Coin",
+        "the item's name heads the menu -- four windows can be stacked up")
+eq(GLOBAL_rollMenu[1].isTitle, 1, "as a title rather than something to click")
+
+eq(table.getn(GLOBAL_rollMenu), 3,
+        "need, greed and nothing to forget yet",
+        tostring(table.getn(GLOBAL_rollMenu)))
+
+check(not GLOBAL_rollMenu[2].checked, "it is on neither list to begin with")
+
+--[[ And choosing one does what the box did. ]]--
+GLOBAL_rollMenu[2].func()
+
+check(qol:OnAutoRollList("need", "Zulian Coin"),
+        "choosing Always Need puts it on the need list")
+
+GLOBAL_rollMenu = qol:RollMenuItems("Zulian Coin")
+check(GLOBAL_rollMenu[2].checked, "and the menu ticks it next time")
+eq(table.getn(GLOBAL_rollMenu), 4, "with a way to take it off again")
+
+--[[ Greed from the Need button, which is the reason this is a menu. ]]--
+GLOBAL_rollMenu[3].func()
+
+check(qol:OnAutoRollList("greed", "Zulian Coin"),
+        "Greed can be chosen from the Need button")
+check(not qol:OnAutoRollList("need", "Zulian Coin"),
+        "and it moves rather than being on both")
+
+GLOBAL_rollMenu = qol:RollMenuItems("Zulian Coin")
+GLOBAL_rollMenu[4].func()
+
+check(not qol:OnAutoRollList("greed", "Zulian Coin"),
+        "and forgetting it clears both lists")
+
+--[[ Nothing to offer for a roll that names nothing. ]]--
+eq(table.getn(qol:RollMenuItems("")), 0, "an unnamed roll has no menu")
+eq(qol:ShowRollMenu(nil), false, "and no roll at all opens nothing")
+
+getglobal("GroupLootFrame1"):Hide()
+EquadisClassicOverhaulDB.autoNeed = ""
+EquadisClassicOverhaulDB.autoGreed = ""
 
 -- ---------------------------------------------------------------------------
 -- and the roll is really made
@@ -15119,6 +16404,125 @@ cfg.showCounts = true
 bars:ApplyText()
 eq(GLOBAL_countText.shown, true, "and switching them back shows them again")
 
+--[==[ **The macro name and the item amount are two strings with two sets of
+     settings, and neither may answer to the other's.**
+
+     Ollie, 2026-10-26, from a screenshot of the Action Bars page showing Macro
+     Name Size and Item Amount Size both at 10: *"check macro name vs item
+     amount"*. The saved profile says the shipped 10 and 12, so the question is
+     whether anything between a setting and the text could cross them. Size,
+     colour and visibility are each checked with the two set *differently*, which
+     is the only way a crossed wire shows -- two equal values cannot tell. ]==]
+function GLOBAL_MacroVsAmountTest()
+    local bars = OB.modules.actionbars
+    local cfg = bars:Config()
+    local macro = getglobal("ActionButton1Name")
+    local count = getglobal("ActionButton1Count")
+
+    local was = {
+        macroSize = cfg.macroSize, countSize = cfg.countSize,
+        macroColor = cfg.macroColor, countColor = cfg.countColor,
+        showMacroNames = cfg.showMacroNames, showCounts = cfg.showCounts,
+    }
+
+    local shipped = OB.defaults.modules.actionbars
+    eq(shipped.macroSize, 10, "the macro name ships at ten")
+    eq(shipped.countSize, 12, "and the item amount at twelve: they are not the same default")
+
+    cfg.macroSize, cfg.countSize = 8, 15
+    cfg.macroColor, cfg.countColor = { 1, 0, 0, 1 }, { 0, 1, 0, 1 }
+    cfg.showMacroNames, cfg.showCounts = true, true
+    bars:ApplyText()
+
+    eq(select(2, macro:GetFont()), 8, "the macro name takes the macro size")
+    eq(select(2, count:GetFont()), 15, "the item amount takes the amount size")
+    local mr, mg = macro:GetTextColor()
+    local cr, cg = count:GetTextColor()
+    eq(mr, 1, "the macro name is red")
+    eq(cg, 1, "and the item amount is green")
+    eq(mg, 0, "the macro name has none of the amount's colour")
+    eq(cr, 0, "and the amount none of the name's")
+
+    --[[ One switched off leaves the other exactly as it was. ]]--
+    cfg.showMacroNames = false
+    bars:ApplyText()
+    eq(macro.shown, false, "the macro name goes when it is switched off")
+    eq(count.shown, true, "and the item amount stays")
+    eq(select(2, count:GetFont()), 15, "at its own size")
+
+    cfg.showMacroNames, cfg.showCounts = true, false
+    bars:ApplyText()
+    eq(count.shown, false, "the item amount goes when it is switched off")
+    eq(macro.shown, true, "and the macro name stays")
+    eq(select(2, macro:GetFont()), 8, "at its own size")
+
+    --[[ Swapped round: the same, the other way. ]]--
+    cfg.showCounts = true
+    cfg.macroSize, cfg.countSize = 15, 8
+    bars:ApplyText()
+    eq(select(2, macro:GetFont()), 15, "the macro name follows its own size when it is the larger")
+    eq(select(2, count:GetFont()), 8, "and the item amount its own when it is the smaller")
+
+    --[[ And the client's repaint of a button -- the pass that puts text back --
+         must leave each at its own size and colour. ]]--
+    bars:UpdateUsable(getglobal("ActionButton1"))
+    eq(select(2, macro:GetFont()), 15, "a repaint leaves the macro name's size")
+    eq(select(2, count:GetFont()), 8, "and the item amount's")
+    mr = macro:GetTextColor()
+    cr, cg = count:GetTextColor()
+    eq(mr, 1, "and the macro name's colour")
+    eq(cg, 1, "and the item amount's")
+
+    for key, value in pairs(was) do cfg[key] = value end
+    bars:ApplyText()
+end
+
+GLOBAL_MacroVsAmountTest()
+
+--[[ **And the panel shows each from its own setting.** The sliders on the Action
+     Bars page are named by module and key, so two cannot share a frame; this
+     proves what they *display* with the two set differently, which is what the
+     screenshot that raised it could not tell apart. ]]--
+function GLOBAL_MacroVsAmountPanelTest()
+    local cfg = OB.modules.actionbars:Config()
+    local was = { macroSize = cfg.macroSize, countSize = cfg.countSize }
+
+    cfg.macroSize, cfg.countSize = 7, 17
+
+    OB.TogglePanel()
+    OB.SelectCategory("Action Bars")
+    OB.RefreshPanel()
+
+    local count, macro, found = nil, nil, {}
+    for key, value in pairs(_G) do
+        if type(key) == "string" and string.find(key, "^EqOBSlider_") then
+            if string.find(key, "_countSize$") then count = value; table.insert(found, key) end
+            if string.find(key, "_macroSize$") then macro = value; table.insert(found, key) end
+        end
+    end
+
+    check(count ~= nil and macro ~= nil, "both sliders exist on the page", table.concat(found, ","))
+    if count and macro then
+        eq(count:GetValue(), 17, "the Item Amount Size slider shows the amount's size")
+        eq(macro:GetValue(), 7, "and the Macro Name Size slider shows the name's")
+        eq(count.box:GetText(), "17", "the amount's box says so too")
+        eq(macro.box:GetText(), "7", "and the name's")
+
+        count:SetValue(11)
+        eq(cfg.countSize, 11, "moving the amount's slider writes the amount's size")
+        eq(cfg.macroSize, 7, "and leaves the name's alone")
+
+        macro:SetValue(13)
+        eq(cfg.macroSize, 13, "moving the name's slider writes the name's size")
+        eq(cfg.countSize, 11, "and leaves the amount's alone")
+    end
+
+    cfg.macroSize, cfg.countSize = was.macroSize, was.countSize
+    OB.RefreshPanel()
+end
+
+GLOBAL_MacroVsAmountPanelTest()
+
 --[==[ **All three strings take the module's own font**, which is the row the
      page has offered since `styled = { font = true }` went in and which did
      nothing at all: `ApplyText` asked `OB.FontPath()` with no module id, so it
@@ -15612,6 +17016,99 @@ GLOBAL_bars:ApplyProgressBars()
 check(not GLOBAL_xpBar.rested:IsShown(), "and nothing is drawn without any")
 
 
+--[==[ **The bars are redrawn by the things that move them.**
+
+     Ollie, 2026-09-24: *"number does [not] update till ui opened"*. Every
+     assertion above this point called `ApplyProgressBars` by hand, so the whole
+     feature was tested through the one path a player never takes. **Not one of
+     the events that changes experience or reputation was registered**: the bars
+     drew once and then held that number until some unrelated event -- entering
+     combat, an aura, a zone load -- happened to force a pass. Opening a panel
+     never repaired anything; it just caused the re-apply that killing the mob
+     should have caused.
+
+     So these drive the **event**, with no `ApplyProgressBars` call of their
+     own, and read what is on the bar afterwards. A test that calls the redraw
+     itself cannot fail this bug -- which is exactly how it shipped. ]==]
+check(Stub.EventListeners("PLAYER_XP_UPDATE") > 0,
+        "gaining experience is listened for")
+check(Stub.EventListeners("UPDATE_FACTION") > 0,
+        "so is reputation changing")
+check(Stub.EventListeners("UPDATE_EXHAUSTION") > 0,
+        "so is the rested pool moving")
+
+GLOBAL_barCfg.showXPBar = true
+GLOBAL_barCfg.xpShowProgress = true
+Stub.player.xp = 4000
+Stub.player.xpMax = 10000
+GLOBAL_bars:ApplyProgressBars()
+
+GLOBAL_xpDrawn = GLOBAL_xpBar.text:GetText()
+check(GLOBAL_xpDrawn and string.find(GLOBAL_xpDrawn, "4000", 1, true),
+        "the bar starts at what the player has", tostring(GLOBAL_xpDrawn))
+
+--[[ The kill. Nothing here re-applies anything by hand. ]]--
+Stub.player.xp = 7777
+Stub.FireEvent("PLAYER_XP_UPDATE")
+
+GLOBAL_xpDrawn = GLOBAL_xpBar.text:GetText()
+check(GLOBAL_xpDrawn and string.find(GLOBAL_xpDrawn, "7777", 1, true),
+        "and gaining experience moves it, with no panel opened",
+        tostring(GLOBAL_xpDrawn))
+
+--[[ Rested drains as it is spent, so it moves with no experience gained. ]]--
+GLOBAL_barCfg.xpShowRested = true
+Stub.player.rested = 2500
+Stub.FireEvent("UPDATE_EXHAUSTION")
+
+check(GLOBAL_xpBar.rested:IsShown(),
+        "the rested overlay comes back on its own event")
+
+--[==[ **And levelling, which is asserted by behaviour rather than by counting
+     listeners.** `PLAYER_LEVEL_UP` is registered by the character panel as
+     well, so a listener count is true whatever this module does -- it passed
+     with the bug still in. Reaching the cap has to actually take the bar away
+     on the event alone. ]==]
+Stub.player.level = GLOBAL_capLevel
+Stub.FireEvent("PLAYER_LEVEL_UP")
+check(not GLOBAL_xpBar:IsShown(),
+        "and hitting the cap takes the bar away on the level event alone")
+
+Stub.player.level = 58
+Stub.FireEvent("PLAYER_LEVEL_UP")
+check(GLOBAL_xpBar:IsShown(), "while below it the bar is back")
+
+--[==[ **And reputation, which had a subtler version of the same hole.**
+
+     `CHAT_MSG_COMBAT_FACTION_CHANGE` *was* registered, so this looked covered.
+     It is not the same event: it carries no values, it is only how the bar
+     learns which faction was last earned, and it fires for combat reputation
+     alone -- **a quest turn-in moved the number with nothing listening.** ]==]
+GLOBAL_barCfg.showRepBar = true
+GLOBAL_barCfg.repShowFaction = true
+GLOBAL_barCfg.repShowProgress = true
+Stub.watchedFaction = { name = "Argent Dawn", standing = 5,
+        min = 9000, max = 21000, value = 12000 }
+GLOBAL_bars:ApplyProgressBars()
+
+GLOBAL_repBar = getglobal("EquadisClassicOverhaulReputationBar")
+GLOBAL_repDrawn = GLOBAL_repBar.text:GetText()
+check(GLOBAL_repDrawn and string.find(GLOBAL_repDrawn, "3000", 1, true),
+        "the reputation bar starts at the position inside the band",
+        tostring(GLOBAL_repDrawn))
+
+--[[ The turn-in: no combat line, so only `UPDATE_FACTION` announces it. ]]--
+Stub.watchedFaction.value = 15500
+Stub.FireEvent("UPDATE_FACTION")
+
+GLOBAL_repDrawn = GLOBAL_repBar.text:GetText()
+check(GLOBAL_repDrawn and string.find(GLOBAL_repDrawn, "6500", 1, true),
+        "and a quest turn-in moves it too", tostring(GLOBAL_repDrawn))
+
+Stub.watchedFaction = nil
+Stub.player.rested = 0
+
+
 --[[ **At the cap there is no experience bar**, whatever the client answers.
 
      It hid itself when `UnitXPMax` returned nothing, which is what a plain 1.12
@@ -15712,6 +17209,72 @@ GLOBAL_barCfg.repFollowsLatest = true
      faction gives a bar with nil bounds. ]]--
 eq(GLOBAL_bars:FactionByName("Other"), nil,
         "a list header is not mistaken for a faction")
+
+
+--[==[ **And a faction under a shut header is still found.**
+
+     `GetNumFactions` does not answer how many factions a character has. It
+     answers **how many rows the reputation panel would draw right now**, and a
+     collapsed header draws itself and none of its children -- so a faction the
+     character plainly has is unreachable by index while its header is shut.
+
+     This is the other half of what Ollie reported on 2026-09-24. v0.99.326
+     fixed the redraw; this is why the bar could still be **empty** with nothing
+     pinned. Timbermaw Hold sits under the "Other" header in this fixture, which
+     is exactly the shape of the real list. ]==]
+Stub.factions[2].collapsed = true
+
+--[[ First: the hole itself. With the header shut the faction is not in the
+     list at all, which is the thing no test could see until the harness could
+     collapse a header. ]]--
+GLOBAL_repVisible = false
+function GLOBAL_RepListHas(want)
+    for i = 1, (GetNumFactions() or 0) do
+        if GetFactionInfo(i) == want then return true end
+    end
+    return false
+end
+
+check(not GLOBAL_RepListHas("Timbermaw Hold"),
+        "a shut header takes its factions out of the list entirely")
+
+eq(GLOBAL_bars:FactionByName("Timbermaw Hold"), "Timbermaw Hold",
+        "and the bar finds it anyway")
+
+--[[ **The panel is left as it was found.** Opening somebody's reputation
+     headers is a visible change to their interface; doing it and not putting
+     them back would be a worse bug than the one being fixed. ]]--
+check(Stub.factions[2].collapsed,
+        "with the header shut again afterwards")
+check(not GLOBAL_RepListHas("Timbermaw Hold"),
+        "and the list back the way the player left it")
+
+--[==[ **A faction that was reachable all along costs nothing.** The expand is
+     only reached when the plain read has already failed, so a shut header
+     nobody needed opening stays shut. ]==]
+eq(GLOBAL_bars:FactionByName("Argent Dawn"), "Argent Dawn",
+        "a visible faction is read without touching anything")
+check(Stub.factions[2].collapsed,
+        "and an unrelated shut header is not opened to do it")
+
+--[[ The whole point of finding it: the bar draws. ]]--
+GLOBAL_repName, _, GLOBAL_repValue, GLOBAL_repMax = GLOBAL_bars:BarFaction()
+eq(GLOBAL_repName, "Timbermaw Hold",
+        "so the bar follows a faction whose header is shut")
+eq(GLOBAL_repValue, 1200, "with the right position in its band")
+
+GLOBAL_bars:ApplyProgressBars()
+check(GLOBAL_repBar:IsShown(),
+        "and it is drawn rather than left empty at login")
+
+--[[ A faction that genuinely is not there is still nothing, shut header or
+     not -- the expand must not turn "no such faction" into an answer. ]]--
+eq(GLOBAL_bars:FactionByName("Bloodsail Buccaneers"), nil,
+        "a faction the character does not have is still nothing")
+check(Stub.factions[2].collapsed,
+        "and the failed search puts the header back too")
+
+Stub.factions[2].collapsed = nil
 
 -- ---------------------------------------------------------------------------
 -- what each bar says, one switch per thing it says
@@ -15814,6 +17377,50 @@ check(GLOBAL_xpRested and string.find(GLOBAL_xpRested, "2500", 1, true),
 GLOBAL_bars:ApplyProgressBars()
 check(GLOBAL_xpBar.mouseEnabled ~= false,
         "and the bar is there to be pointed at")
+
+--[==[ **And hovering it opens a tooltip of its own rather than joining the
+     last one.**
+
+     `SetOwner` does not empty a tooltip on this client and neither does
+     `Hide`; the client's own code always follows `SetOwner` with `SetText`,
+     which is the call that drops what was there. Both of these bars opened
+     with `AddLine`, so hovering one straight after an item read as that item's
+     tooltip with "Argent Dawn" stuck on the end -- the same fault the
+     character sheet's stat rows had. Four places in this addon did it. ]==]
+Stub.itemIds["Bar Neighbour"] = 200
+Stub.tooltips["item16"] = { "Bar Neighbour" }
+
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 5)
+check(GameTooltip:NumLines() > 1, "an item tooltip has been up")
+
+--[[ Hidden first, which is what leaving the item does -- and is not enough on
+     its own, which is the whole point of the assertion below. ]]--
+GameTooltip:Hide()
+check(GLOBAL_bars:ShowRepTooltip(GLOBAL_repBar), "the reputation bar has a hover")
+eq(getglobal("GameTooltipTextLeft1"):GetText(), "Argent Dawn",
+        "and its own first line")
+eq(GameTooltip:NumLines(), 3, "with only its own rows on it",
+        tostring(GameTooltip:NumLines()))
+
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 5)
+GameTooltip:Hide()
+
+check(GLOBAL_bars:ShowXPTooltip(GLOBAL_xpBar), "so does the experience bar")
+check(string.find(tostring(getglobal("GameTooltipTextLeft1"):GetText()),
+        "Bar Neighbour", 1, true) == nil,
+        "and nothing of the item it followed is on it",
+        tostring(getglobal("GameTooltipTextLeft1"):GetText()))
+
+GameTooltip:Hide()
+Stub.tooltips["item16"] = nil
 
 --[[ Put back, because a rested pool left set is a state most of a levelling
      life is not spent in and everything after this would inherit it. ]]--
@@ -16250,26 +17857,279 @@ eq(GLOBAL_where["cooldownNumbers"], "general",
 --[[ Paging is a property of the main bar rather than a feature beside it. ]]--
 eq(GLOBAL_where["pagingBar"], "main", "paging belongs to the bar it pages")
 
---[[ **The bag button wears the client's own backpack art.**
+--[==[ **A keybinding still reaches its button after this addon has moved it.**
 
-     Read off `MainMenuBarBackpackButton` rather than named in the module, so it
-     is literally the picture the bag bar was showing -- including on a client or
-     UI addon that ships its own. A path written into the code would be a second
-     answer to "what does a bag look like", and the two would drift.
+     Ollie, 2026-10-23: *"Check Nue. shift + key spells arent working."* His
+     shift keys are all bound to `MULTIACTIONBAR1BUTTON1..12` -- the Bottom Left
+     bar -- and on that character ECO owns the bars, where on Equadis the old
+     standalone still does.
 
-     The stub's backpack is given a texture nothing else uses, so "copied it"
-     and "hardcoded something that happens to look right" are different
-     outcomes. ]]--
+     This module **re-parents every action button onto a container of its own**,
+     which is a reasonable thing to suspect of eating a keypress. It does not,
+     and now that is a fact rather than an opinion: the client's own two-step
+     binding path is driven here, down then up, and the button it was aimed at
+     is the button that gets clicked.
+
+     Neither half existed in the harness before this, so the path from a key to
+     a spell had never been exercised at all -- `Click`, `SetButtonState` and
+     `MultiActionButtonDown`/`Up` were all answered by the auto-faking
+     metatable. A whole class of "my keybind stopped working" was untestable. ]==]
+GLOBAL_barCfg.showBottomLeft = true
+GLOBAL_bars:Apply()
+
+GLOBAL_shiftButton = getglobal("MultiBarBottomLeftButton1")
+check(GLOBAL_shiftButton ~= nil, "the bar the shift keys point at has buttons")
+
+--[[ Moved onto one of ours, which is the thing being cleared of suspicion. ]]--
+check(GLOBAL_shiftButton:GetParent() ~= nil
+        and GLOBAL_shiftButton:GetParent():GetName() ~= "MultiBarBottomLeft",
+        "and this addon has taken them onto a container of its own",
+        tostring(GLOBAL_shiftButton:GetParent()
+                and GLOBAL_shiftButton:GetParent():GetName()))
+
+check(GLOBAL_shiftButton:IsVisible(), "the button is on screen")
+
+GLOBAL_shiftClicks = GLOBAL_shiftButton.clicks or 0
+
+MultiActionButtonDown("MultiBarBottomLeft", 1)
+MultiActionButtonUp("MultiBarBottomLeft", 1)
+
+eq(GLOBAL_shiftButton.clicks, GLOBAL_shiftClicks + 1,
+        "and the client's binding still reaches it",
+        tostring(GLOBAL_shiftButton.clicks))
+
+--[==[ **Both halves, or nothing happens.** The click is on the *up*, and only
+     if the down armed it -- a binding that fires one half does nothing at all,
+     silently, which is what a broken keybind looks like from the keyboard. ]==]
+MultiActionButtonUp("MultiBarBottomLeft", 1)
+eq(GLOBAL_shiftButton.clicks, GLOBAL_shiftClicks + 1,
+        "an up with no down casts nothing")
+
+--[[ And every one of the twelve, because the report was about a row of keys
+     rather than one. ]]--
+GLOBAL_barMisses = {}
+
+for GLOBAL_i = 1, 12 do
+    local b = getglobal("MultiBarBottomLeftButton" .. GLOBAL_i)
+    local before = b and b.clicks or 0
+
+    MultiActionButtonDown("MultiBarBottomLeft", GLOBAL_i)
+    MultiActionButtonUp("MultiBarBottomLeft", GLOBAL_i)
+
+    if not b or b.clicks ~= before + 1 then
+        table.insert(GLOBAL_barMisses, tostring(GLOBAL_i))
+    end
+end
+
+eq(table.getn(GLOBAL_barMisses), 0, "all twelve of them answer their key",
+        table.concat(GLOBAL_barMisses, ", "))
+
+--[==[ **And it fires its own slot, not the main bar's.**
+
+     Ollie, 2026-10-23: *"the button highlights when i press the keybind, but
+     the spell doesnt cast"*. That sentence is the bug split in half -- the
+     highlight is the key's *down*, which only sets a pushed state, and the cast
+     is the *up*, which calls `UseAction(button.action)`.
+
+     The client works out `button.action` in `ActionButton_GetPagedID`, read out
+     of `Interface\FrameXML\ActionButton.lua`:
+
+         local parentName = button:GetParent():GetName();
+         if ( parentName == "MultiBarBottomLeft" ) then ...
+
+     **It identifies the bar by the name of the button's parent frame**, and
+     this module re-parents every action button onto a container of its own. So
+     every multibar button fell into the last branch and resolved to the main
+     bar's slot: `MultiBarBottomLeftButton1`, whose `GetID` is 1, became action
+     **1** instead of **61**. Empty, usually, so the key did nothing at all.
+
+     Bottom-left is page 6, so its first slot is 1 + (6 - 1) x 12 = 61. The
+     numbers are the client's; nothing here recomputes them a second way. ]==]
+GLOBAL_shiftHome = getglobal("MultiBarBottomLeftButton1")
+
+check(GLOBAL_shiftHome.ecoHomeBar == "MultiBarBottomLeft",
+        "a moved button remembers the bar it came from",
+        tostring(GLOBAL_shiftHome.ecoHomeBar))
+
+--[[ The client works the slot out whenever it feels like it -- a spell dragged
+     onto a bar, a page change, a form. Driven here the way it is there. ]]--
+ActionButton_UpdateAction(GLOBAL_shiftHome)
+
+eq(GLOBAL_shiftHome.action, 61,
+        "and resolves to its own slot rather than the main bar's",
+        tostring(GLOBAL_shiftHome.action))
+
+Stub.usedActions = {}
+
+MultiActionButtonDown("MultiBarBottomLeft", 1)
+MultiActionButtonUp("MultiBarBottomLeft", 1)
+
+eq(table.getn(Stub.usedActions), 1, "the key uses an action")
+eq(Stub.usedActions[1].slot, 61, "and it is the one under that key",
+        tostring(Stub.usedActions[1].slot))
+
+--[==[ **Every multibar, because all four are re-parented and all four are
+     keybound.** Bottom-left 6, bottom-right 5, left 4, right 3 -- the pages are
+     not in bar order and cannot be guessed. ]==]
+GLOBAL_slotWant = {
+    { bar = "MultiBarBottomLeft", first = 61 },
+    { bar = "MultiBarBottomRight", first = 49 },
+    { bar = "MultiBarLeft", first = 37 },
+    { bar = "MultiBarRight", first = 25 },
+}
+
+GLOBAL_slotMisses = {}
+
+for GLOBAL_i = 1, table.getn(GLOBAL_slotWant) do
+    local want = GLOBAL_slotWant[GLOBAL_i]
+    local b = getglobal(want.bar .. "Button1")
+
+    if b then
+        ActionButton_UpdateAction(b)
+        if b.action ~= want.first then
+            table.insert(GLOBAL_slotMisses,
+                    want.bar .. " got " .. tostring(b.action)
+                            .. " want " .. want.first)
+        end
+    end
+end
+
+eq(table.getn(GLOBAL_slotMisses), 0, "every bar fires its own slots",
+        table.concat(GLOBAL_slotMisses, " | "))
+
+--[==[ **And a button this addon has not moved is left to the client.** The main
+     bar's own answer depends on the page you are on and on whether you are in a
+     form, and reimplementing that would be a second copy of a rule that already
+     exists. ]==]
+GLOBAL_mainButton = getglobal("ActionButton1")
+
+if GLOBAL_mainButton then
+    eq(GLOBAL_bars:PagedID(GLOBAL_mainButton), nil,
+            "the main bar is not answered by this addon at all",
+            tostring(GLOBAL_bars:PagedID(GLOBAL_mainButton)))
+end
+
+--[==[ **A button already holding the wrong slot is corrected by the layout
+     pass**, rather than waiting for the client to recompute on its own.
+
+     `button.action` is cached, and `MultiActionButtonUp` casts *that*. Without
+     this, a character whose buttons were stamped with the main bar's slots went
+     on firing them through reloads -- nothing recomputes until a page change, a
+     form or a spell dragged onto a bar. Which is how this reached a second
+     report after the first fix would otherwise have been right. ]==]
+GLOBAL_shiftHome.action = 1
+GLOBAL_bars:Apply()
+
+eq(GLOBAL_shiftHome.action, 61,
+        "a stale slot is put right without waiting for the client",
+        tostring(GLOBAL_shiftHome.action))
+
+Stub.usedActions = {}
+MultiActionButtonDown("MultiBarBottomLeft", 1)
+MultiActionButtonUp("MultiBarBottomLeft", 1)
+
+eq(Stub.usedActions[1] and Stub.usedActions[1].slot, 61,
+        "so the very next keypress casts the right thing",
+        tostring(Stub.usedActions[1] and Stub.usedActions[1].slot))
+
+--[[ A nil slot is a miss rather than an error. `GetActionTexture(nil)` is a
+     real call -- a button that has not been given a slot yet -- and it used to
+     throw from inside a wrapper around one of the client's own functions. ]]--
+eq(OB.modules.qol:MacroIcon(nil), nil, "an action slot of nothing asks nothing")
+
+--[==[ **The bag button wears the client's own backpack picture.**
+
+     Ollie, 2026-10-01: *"revamp the bag button icon. its empty at the moment,
+     and using the border, not real in-game assets"*.
+
+     These assertions used to read `MainMenuBarBackpackButton:GetNormalTexture()`
+     and call it the backpack art. On a real client that is `UI-Quickslot2` --
+     **the quickslot rim**. `MainMenuBarBackpackButton` is an item button, and on
+     every item button in a 1.12 interface the rim is the normal texture while
+     the picture is on `$parentIconTexture`. So the feature drew a rim where a
+     bag belonged, stretched to fill the button and sat inside ECO's own gold
+     square: an empty bordered box with a second border inside it, which is
+     exactly what was reported.
+
+     It passed because the stub's bag buttons had no textures at all and no
+     icon region to be wrong about. They are item buttons now, carrying what the
+     client carries.
+
+     The icon region is given a texture nothing else uses, so "copied the
+     picture" and "happened to land on something that looks right" are different
+     outcomes. ]==]
 GLOBAL_pack = getglobal("MainMenuBarBackpackButton")
-GLOBAL_pack:SetNormalTexture("Interface99Bags99SomeonesOwnBackpack")
+GLOBAL_packIcon = getglobal("MainMenuBarBackpackButtonIconTexture")
+
+check(GLOBAL_packIcon ~= nil, "the client's backpack button has an icon region")
+
+GLOBAL_packIcon:SetTexture("Interface99Bags99SomeonesOwnBackpack")
 
 GLOBAL_barCfg.bagButton = true
 GLOBAL_bars:ApplyBagButton()
 
 GLOBAL_bagBtn = getglobal("EquadisClassicOverhaulBagButton")
 check(GLOBAL_bagBtn ~= nil, "there is a bag button")
-eq(GLOBAL_bagBtn.icon.texture, GLOBAL_pack:GetNormalTexture():GetTexture(),
-        "wearing whatever the client draws on its backpack")
+eq(GLOBAL_bagBtn.icon.texture, "Interface99Bags99SomeonesOwnBackpack",
+        "wearing the picture the client draws, not the rim around it",
+        tostring(GLOBAL_bagBtn.icon.texture))
+
+--[==[ **A rim is refused**, whichever region it turns up on, in favour of the
+     path the client itself uses for this picture.
+
+     A fallback that is right beats a copy that is wrong, and the wrong copy is
+     indistinguishable from an empty slot -- which is why it went unreported as a
+     bug for so long and then got reported as "empty". ]==]
+GLOBAL_packIcon:SetTexture("Interface\\Buttons\\UI-Quickslot2")
+GLOBAL_bars:ApplyBagButton()
+
+eq(GLOBAL_bagBtn.icon.texture, "Interface\\Buttons\\Button-Backpack-Up",
+        "a quickslot rim is not a picture of a bag",
+        tostring(GLOBAL_bagBtn.icon.texture))
+
+--[[ And neither is this addon's own art: `SkinButton` strips a button's normal
+     texture and paints fills of its own, so a backpack ECO has already
+     restyled has nothing on it worth copying. ]]--
+GLOBAL_packIcon:SetTexture(
+        "Interface\\AddOns\\EquadisClassicOverhaul\\textures\\edge")
+GLOBAL_bars:ApplyBagButton()
+
+eq(GLOBAL_bagBtn.icon.texture, "Interface\\Buttons\\Button-Backpack-Up",
+        "nor is this addon's own skin", tostring(GLOBAL_bagBtn.icon.texture))
+
+--[==[ **Dressed as an item slot, in the client's own art.**
+
+     It wore `OB.SkinButton` -- this addon's gold square -- and the standing rule
+     is that ECO's skin is for the setup walkthrough and the options panel while
+     anything drawn where the client's interface lives uses the client's widgets.
+     A thing you click to open your bags is an item slot, and the client has
+     item slots.
+
+     The rim is drawn **larger than the button**: `UI-Quickslot2` is a picture of
+     a rim with a clear middle and the rim sits well inside the image, so at the
+     button's own size it lands as a square across the middle of the icon with
+     the picture showing round the outside. That exact failure has been found
+     twice before in this addon -- the bag strip and the item slot -- and this
+     makes it three. ]==]
+eq(GLOBAL_bagBtn:GetNormalTexture():GetTexture(),
+        "Interface\\Buttons\\UI-Quickslot2", "the rim is the client's own")
+eq(GLOBAL_bagBtn:GetPushedTexture():GetTexture(),
+        "Interface\\Buttons\\UI-Quickslot-Depress", "so is the press")
+eq(GLOBAL_bagBtn:GetHighlightTexture():GetTexture(),
+        "Interface\\Buttons\\ButtonHilight-Square", "and the hover light")
+
+check(not GLOBAL_bagBtn.ecoSkinned,
+        "and it is not wearing this addon's square as well")
+
+GLOBAL_bagRing = GLOBAL_bagBtn:GetNormalTexture()
+check(GLOBAL_bagRing:GetWidth() > GLOBAL_bagBtn:GetWidth(),
+        "the rim overhangs the button it rims",
+        GLOBAL_bagRing:GetWidth() .. " over " .. GLOBAL_bagBtn:GetWidth())
+
+--[[ And the picture fills the button, so the rim falls on its edges the way
+     the client's slots do rather than sitting outside an inset icon. ]]--
+eq(GLOBAL_bagBtn.icon:GetWidth(), GLOBAL_bagBtn:GetWidth(),
+        "while the picture fills the button")
 
 --[[ **And it replaces the client's slots rather than joining them.** Six slots
      plus a seventh button is more furniture, not less. ]]--
@@ -16298,12 +18158,26 @@ check(not GLOBAL_pack:IsShown(), "and the client's slots stay away")
 
 --[[ Re-read each pass, not cached at build time: the button lives for the
      session and a UI addon may restyle the backpack after it is made. ]]--
-GLOBAL_pack:SetNormalTexture("Interface99Bags99ADifferentBackpack")
+GLOBAL_packIcon:SetTexture("Interface99Bags99ADifferentBackpack")
 GLOBAL_barCfg.bagButton = true
 GLOBAL_bars:ApplyBagButton()
 
-eq(GLOBAL_bagBtn.icon.texture, GLOBAL_pack:GetNormalTexture():GetTexture(),
-        "and follows it if that changes later")
+eq(GLOBAL_bagBtn.icon.texture, "Interface99Bags99ADifferentBackpack",
+        "and follows it if that changes later",
+        tostring(GLOBAL_bagBtn.icon.texture))
+
+--[[ A UI addon that replaces the whole button may put its art on the normal
+     texture instead, which is the one case the old reading was right about. ]]--
+GLOBAL_packIcon:SetTexture(nil)
+GLOBAL_pack:SetNormalTexture("Interface99Bags99OnTheButtonItself")
+GLOBAL_bars:ApplyBagButton()
+
+eq(GLOBAL_bagBtn.icon.texture, "Interface99Bags99OnTheButtonItself",
+        "or from the button itself when there is no picture region to read",
+        tostring(GLOBAL_bagBtn.icon.texture))
+
+GLOBAL_pack:SetNormalTexture("Interface\\Buttons\\UI-Quickslot2")
+GLOBAL_packIcon:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
 
 GLOBAL_barCfg.bagButton = false
 GLOBAL_bars:ApplyBagButton()
@@ -18376,6 +20250,144 @@ GLOBAL_tipMod:Config().compareOnShift = false
 eq(GLOBAL_tipMod:ShowComparisons(GameTooltip), 0, "switched off it compares nothing")
 GLOBAL_tipMod:Config().compareOnShift = true
 
+--[==[ **A comparison starts from a link, and that is the whole of the bug.**
+
+     Ollie, 2026-10-01: *"hold shift to compare is not showing the second
+     tooltip"* -- the second report of the same thing, and it was never an edge
+     case. `ShowComparisons` read `TooltipItemIdentity`'s **third** return into a
+     variable called `link`, and the third return is the item's *name*.
+
+     1.12's `GetItemInfo` does not take a name. In game it answered nothing, the
+     equip slot came back nil, and the comparison concluded the item could not be
+     worn -- so nothing was ever shown, for any item. It passed here only because
+     this suite's `GetItemInfo` searched the fixture by name as a convenience.
+     That convenience is gone, and these three assertions are what replaces it. ]==]
+--[==[ **And a link is not one either, on this client.**
+
+     Ollie, 2026-10-23, `/eq comparedebug` over a pair of boots:
+
+         item under the cursor: [Loose Chain Boots]
+         equip slot from GetItemInfo: nil
+
+     A real link, a common item, its tooltip on screen, and nothing came back.
+     This client's `GetItemInfo` will not take a **decorated hyperlink** -- the
+     `|cff...|Hitem:2385:0:0:0|h[Name]|h|r` shape that `GetContainerItemLink`
+     and `GameTooltip:GetItem` hand out. Its own code never passes one:
+     `ContainerFrame.lua` calls `GetItemInfo(tonumber(id))` and aux passes a
+     bare item string.
+
+     The harness used to dig `item:(%d+)` out of any string at all, so a link
+     resolved here and nowhere else. **Twenty assertions failed the moment it
+     stopped** -- shift to compare, and the whole of the bag sorter's stacking,
+     which is why `maxStack` was nil and nothing ever merged. One cause under
+     two complaints, reported nine times between them. ]==]
+eq(OB.ItemQuery(6001), 6001, "an id is already what the client wants")
+eq(OB.ItemQuery("item:6001:0:0:0"), 6001, "an item string gives up its id")
+eq(OB.ItemQuery("|cff0070dd|Hitem:6001:0:0:0|h[Test Ring]|h|r"), 6001,
+        "and so does a full link, which is the whole point")
+eq(OB.ItemQuery("Test Ring"), "Test Ring",
+        "a name has no id in it and is handed on unchanged")
+eq(OB.ItemQuery(nil), nil, "and nothing gives nothing")
+
+--[[ The link form is what every caller actually holds, so it has to resolve. ]]--
+GLOBAL_linkSlots = GLOBAL_tipMod:CompareSlotsFor(
+        "|cff0070dd|Hitem:6001:0:0:0|h[Test Ring]|h|r")
+eq(table.getn(GLOBAL_linkSlots or {}), 2,
+        "so a comparison started from a link finds its slots",
+        tostring(GLOBAL_linkSlots and table.getn(GLOBAL_linkSlots)))
+
+eq(GLOBAL_tipMod:CompareSlotsFor("Test Ring"), nil,
+        "a name is not an identity the client can look up")
+
+GLOBAL_idSlots = GLOBAL_tipMod:CompareSlotsFor(6001)
+eq(table.getn(GLOBAL_idSlots or {}), 2, "a bare id is")
+
+--[==[ **Driven the way the client drives it**: an item in a bag, hovered, with
+     the identity coming from `GameTooltip:GetItem()` -- the client's own answer
+     and the first thing `TooltipItemLink` asks for.
+
+     That branch existed before and was dead code in this suite, because nothing
+     here modelled `GetItem` at all. It is modelled now, so the path the game
+     takes is the path this test takes. ]==]
+Stub.bags[1] = Stub.bags[1] or {}
+Stub.bags[1][3] = {
+    name = "Test Ring",
+    link = "|cff1eff00|Hitem:6001:0:0:0|h[Test Ring]|h|r",
+    texture = "Interface\\Icons\\INV_Jewelry_Ring_01",
+    count = 1,
+}
+
+Stub.equipped[12] = { 7002 }
+
+GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+GameTooltip:SetBagItem(1, 3)
+GameTooltip:Show()
+
+eq(GLOBAL_tipMod:TooltipItemLink(GameTooltip),
+        "|cff1eff00|Hitem:6001:0:0:0|h[Test Ring]|h|r",
+        "the client's own answer is what the comparison starts from",
+        tostring(GLOBAL_tipMod:TooltipItemLink(GameTooltip)))
+
+eq(GLOBAL_tipMod:ShowComparisons(GameTooltip), 2,
+        "and a ring hovered in a bag is held against both fingers",
+        tostring(GLOBAL_tipMod:ShowComparisons(GameTooltip)))
+
+--[==[ **With the worn ring's name on it, which is the part that was never
+     asked.**
+
+     Every assertion here used to stop at `IsShown()`. A 1.12 tooltip with no
+     lines in it is shown, sized to nothing, and invisible -- so "the comparison
+     appeared" and "a blank frame appeared where the comparison should be" were
+     the same result, and the feature has now been reported broken three times
+     against a green suite.
+
+     The harness was half the reason: its `SetInventoryItem` read a fixture
+     almost nothing set and otherwise cleared the tooltip and returned. It fills
+     from the equipped slot now, so there is something to assert. ]==]
+Stub.items[7001] = Stub.items[7001]
+        or { name = "Ring of Protection", rarity = 2, equipLoc = "INVTYPE_FINGER" }
+
+GLOBAL_shopOne = getglobal("ShoppingTooltip1")
+
+check((GLOBAL_shopOne:NumLines() or 0) > 0,
+        "the comparison has lines on it rather than being an empty frame",
+        tostring(GLOBAL_shopOne:NumLines()))
+
+check(GLOBAL_shopOne:GetWidth() > 0 and GLOBAL_shopOne:GetHeight() > 0,
+        "and a size, which a tooltip with nothing in it does not have",
+        GLOBAL_shopOne:GetWidth() .. " x " .. GLOBAL_shopOne:GetHeight())
+
+--[==[ **And through the pass that raises it**, not only through the function
+     that draws it.
+
+     A 1.12 tooltip is not rebuilt when a modifier changes, so there is no event
+     for this and the shift key has to be *looked at* -- by `GameTooltip`'s own
+     `OnUpdate`, which is where the live feature lives. Calling `ShowComparisons`
+     by hand proves the drawing and says nothing about whether anything ever
+     calls it. ]==]
+GLOBAL_tipMod:HideComparisons()
+GLOBAL_tipMod.comparing = nil
+GLOBAL_tipMod.comparedItem = nil
+GLOBAL_tipMod.tooltipWasShown = nil
+
+GLOBAL_tipUpdate = GameTooltip:GetScript("OnUpdate")
+check(GLOBAL_tipUpdate ~= nil, "the tooltip carries ECO's frame pass")
+
+GLOBAL_tipUpdate()
+
+check(getglobal("ShoppingTooltip1"):IsShown(),
+        "holding shift over an item raises the comparison from that pass")
+
+Stub.bags[1][3] = nil
+Stub.equipped[12] = nil
+
+--[[ The frame pass above is throttled and remembers when it last ran. Left
+     behind, that timer belongs to this block's clock and the throttle's own
+     tests further down start mid-interval -- counting nothing on the frame they
+     expect their first pass. Handed back the way it was found. ]]--
+GLOBAL_tipMod.tooltipWasShown = nil
+GLOBAL_tipMod.lastTooltipPass = nil
+
 Stub.shiftDown = false
 Stub.equipped[11] = nil
 GLOBAL_tipMod:HideComparisons()
@@ -19103,6 +21115,180 @@ check(GameTooltip.eqEcoStaticHooked == nil,
 check(OB.modules.tooltip.itemRefWrapper ~= nil, "the chat-link click is hooked")
 eq(SetItemRef, OB.modules.tooltip.itemRefWrapper, "and it is the live handler")
 
+--[==[ **A placeholder is not a value.** `Vendor: ?` is a row another addon
+     wrote for an item it does not know, and ECO used to adopt the `?` as
+     its own vendor text -- so an item with no known price read as one whose
+     price had gone wrong. Anything with no digit in it is dropped now. ]==]
+--[==[ **The baseline covers the server's own items now**, not only vanilla's.
+     It had 10,467 rows and nothing at all between 22000 and 24000, so a
+     Zul'Gurub set piece -- Darkmantle Boots, 22003 -- had no price from any
+     source and the row read Unknown for ever. Read from the server's own
+     database and merged. ]==]
+--[[ Asked the way the tooltip asks -- through the market -- rather than of
+     the table directly: what matters is that a price reaches the row. ]]--
+GLOBAL_zgPrice = OB.Market:GetPrices(22003, 0)
+eq(GLOBAL_zgPrice and GLOBAL_zgPrice.vendor, 25261,
+        "the reported item has a price now",
+        tostring(GLOBAL_zgPrice and GLOBAL_zgPrice.vendor))
+eq(GLOBAL_zgPrice and GLOBAL_zgPrice.vendorSource, "eco-static",
+        "from the shipped baseline")
+
+GLOBAL_zgPriced = 0
+for GLOBAL_i = 22000, 23999 do
+    local GLOBAL_p = OB.Market:GetPrices(GLOBAL_i, 0)
+    if GLOBAL_p and GLOBAL_p.vendor then GLOBAL_zgPriced = GLOBAL_zgPriced + 1 end
+end
+check(GLOBAL_zgPriced > 100, "and the block that was empty has prices in it now",
+        tostring(GLOBAL_zgPriced))
+
+--[[ And the server's own items, which the vanilla baseline never had at all:
+     the ranges above 40000 are OctoWow's own and were entirely unpriced. ]]--
+GLOBAL_customPriced = 0
+for GLOBAL_i = 55000, 55999 do
+    local GLOBAL_p = OB.Market:GetPrices(GLOBAL_i, 0)
+    if GLOBAL_p and GLOBAL_p.vendor then
+        GLOBAL_customPriced = GLOBAL_customPriced + 1
+    end
+end
+check(GLOBAL_customPriced > 50, "the server's own items are priced too",
+        tostring(GLOBAL_customPriced))
+
+--[==[ **What a merchant answered and the site never did.** The scrape left
+     whole custom blocks unresolved, but this account had already stood at a
+     merchant with some of those items in its bags and Improved SellValue had
+     written the number down. Forty such rows are merged. They are observed
+     prices, so a damaged weapon's row may read low -- a live merchant
+     observation still wins over the baseline, which is the point of the
+     provider order. ]==]
+GLOBAL_observed = OB.Market:GetPrices(60536, 0)
+eq(GLOBAL_observed and GLOBAL_observed.vendor, 38604,
+        "a price only a merchant knew reaches the row",
+        tostring(GLOBAL_observed and GLOBAL_observed.vendor))
+eq(GLOBAL_observed and GLOBAL_observed.vendorSource, "eco-static",
+        "and it arrives as baseline, not as a guess")
+
+GLOBAL_observed = OB.Market:GetPrices(70167, 0)
+eq(GLOBAL_observed and GLOBAL_observed.vendor, 1400,
+        "so does a custom recipe the site had nothing for",
+        tostring(GLOBAL_observed and GLOBAL_observed.vendor))
+
+GLOBAL_observed = OB.Market:GetPrices(83217, 0)
+eq(GLOBAL_observed and GLOBAL_observed.vendor, 8741,
+        "and one from the 83000 block",
+        tostring(GLOBAL_observed and GLOBAL_observed.vendor))
+
+eq(EquadisClassicOverhaul.modules.tooltip:PriceValueTextForTest("Vendor: ?"), nil,
+        "a question mark is not adopted as a price")
+eq(EquadisClassicOverhaul.modules.tooltip:PriceValueTextForTest("Vendor: |cffffffff-|r"), nil,
+        "nor is a dash")
+check(EquadisClassicOverhaul.modules.tooltip:PriceValueTextForTest("Vendor: 2g 52s") ~= nil,
+        "while a real figure is kept")
+
+--[==[ **The client rebuilds a tooltip that is already up, on every frame, and
+     this addon's decoration went with it.**
+
+     `PaperDollItemSlotButton_OnUpdate` and `BuffButton_OnUpdate` -- the
+     client's own FrameXML, read out of the MPQ -- both check
+     `GameTooltip:IsOwned(this)` and then refill the tooltip in place:
+     `SetInventoryItem` for an equipped slot, `SetPlayerBuff` for a buff.
+     Neither calls `Show`, because the tooltip never went away, so `OnShow`
+     never fires again and the pass that hangs off it never runs.
+
+     The first frame of a hover was ours and every frame after it was the
+     client's. Nothing flickered, so it read as the character sheet and the
+     buffs simply using the plain vanilla tooltip -- which is how it was
+     reported. ]==]
+function GLOBAL_TipText()
+    local out = {}
+    for GLOBAL_i = 1, GameTooltip:NumLines() do
+        local GLOBAL_fs = getglobal("GameTooltipTextLeft" .. GLOBAL_i)
+        table.insert(out, tostring(GLOBAL_fs and GLOBAL_fs:GetText()))
+    end
+    return table.concat(out, " | ")
+end
+
+Stub.itemIds["Repop Blade"] = 200
+Stub.itemIds["Repop Shield"] = 2589
+Stub.tooltips["item16"] = { "Repop Blade" }
+Stub.tooltips["item17"] = { "Repop Shield" }
+
+GameTooltip:Hide()
+Stub.Tick(0.05, 3)
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 6)
+
+check(string.find(GLOBAL_TipText(), "Vendor:", 1, true) ~= nil,
+        "the first hover of an equipped slot is decorated", GLOBAL_TipText())
+
+--[==[ **The refill, with no `Hide` and no `Show` between** -- exactly what the
+     client's OnUpdate does sixty times a second while the cursor rests on the
+     slot. Before this it wiped the value block and nothing put it back. ]==]
+GameTooltip:SetInventoryItem("player", 17)
+
+eq(getglobal("GameTooltipTextLeft1"):GetText(), "Repop Shield",
+        "a refill in place shows the new item")
+check(string.find(GLOBAL_TipText(), "Vendor:", 1, true) ~= nil,
+        "and keeps this addon's value block", GLOBAL_TipText())
+
+--[[ The refilled tooltip is priced as the item it now holds, not as the one it
+     held a frame ago. 2589 sells for 13 copper and 200 for four silver. ]]--
+check(string.find(GLOBAL_TipText(), "13c", 1, true) ~= nil,
+        "priced as the item it now holds", GLOBAL_TipText())
+
+--[==[ A buff refills through `SetPlayerBuff` rather than `SetInventoryItem`,
+     and is the other half of the same report. ]==]
+Stub.tooltips["buff3"] = { "Repop Blade", "Lasts 30 sec." }
+GameTooltip:SetPlayerBuff(3)
+
+eq(getglobal("GameTooltipTextLeft1"):GetText(), "Repop Blade",
+        "a buff refill shows the buff")
+check(string.find(GLOBAL_TipText(), "Vendor:", 1, true) ~= nil,
+        "and is decorated the same way", GLOBAL_TipText())
+
+--[==[ **A tooltip that is not yet up is left alone.** The `Show` about to
+     follow fires `OnShow`, which does the work; doing it here as well is only
+     the work twice, on the one path that runs for every tooltip in the game. ]==]
+GameTooltip:Hide()
+Stub.Tick(0.05, 3)
+GLOBAL_tipMod = EquadisClassicOverhaul.modules.tooltip
+GLOBAL_tipMod.pendingTooltip = nil
+eq(GLOBAL_tipMod:AfterRepopulate(GameTooltip), false,
+        "a hidden tooltip is not decorated on refill")
+
+--[==[ **Taken over rather than stacked on.** The guard lives on a module table
+     that a reload rebuilds while the method sits on a frame that it does not,
+     so a second install has to recognise its own wrapper and wrap what *that*
+     was wrapping -- the lesson the OnShow wrapper had to learn after the suite
+     overflowed the stack on it. ]==]
+GLOBAL_wrapped = GameTooltip.SetInventoryItem
+GLOBAL_tipMod:InstallRepopulationHooks()
+eq(GameTooltip.SetInventoryItem, GLOBAL_wrapped,
+        "installing twice leaves one wrapper, not two")
+
+GLOBAL_tipMod.repopWrappers["SetInventoryItem"] = nil
+GLOBAL_tipMod:InstallRepopulationHooks()
+eq(EquadisOverhaulTooltipRepop["SetInventoryItem"].inner,
+        GLOBAL_tipMod.repopOriginals["SetInventoryItem"],
+        "and a fresh module table wraps the client's own method again")
+
+--[==[ The client's methods are the client's. Switching the module off hands
+     every one of them back, the same rule the enchant hovers are restored
+     under. ]==]
+GLOBAL_client = GLOBAL_tipMod.repopOriginals["SetPlayerBuff"]
+check(GLOBAL_tipMod:RestoreRepopulationHooks() > 0, "unbinding gives them back")
+eq(GameTooltip.SetPlayerBuff, GLOBAL_client, "SetPlayerBuff is the client's again")
+
+GLOBAL_tipMod:InstallRepopulationHooks()
+
+Stub.tooltips["item16"] = nil
+Stub.tooltips["item17"] = nil
+Stub.tooltips["buff3"] = nil
+GameTooltip:Hide()
+Stub.Tick(0.05, 3)
+
+
 Stub.tooltips["eqLinkA"] = { "Rod of Alpha", "Vendor Buy : 28.55", "Vendor: ?" }
 Stub.tooltips["eqLinkB"] = { "Blade of Beta" }
 
@@ -19514,6 +21700,59 @@ eq(select(2, GLOBAL_zone:GetFont()), 16, "and follows the slider once set")
 cfg.zoneColor = { 1, 0, 0, 1 }
 map:ApplyZone()
 eq(select(1, GLOBAL_zone:GetTextColor()), 1, "the colour applies too")
+
+cfg.zoneSize = 0
+
+--[==[ **And zero does not reach `SetFont`, on the header this module owns.**
+
+     `tonumber(cfg.zoneSize) or 11` reads as "eleven unless somebody chose a
+     size". It is not: **zero is truthy in Lua**, the slider starts at zero, and
+     zero is what ships -- so every default profile handed `SetFont` a size of
+     **0**. That fails silently and leaves the FontString with **no font at
+     all**, and the next `SetText` on it is an error rather than a no-op, which
+     aborts whatever was mid-apply.
+
+     Ollie's `/eq selftest` on 2026-09-28 counted it: *3 of 348 font strings
+     have no font*. This is where they came from, and it was reachable by
+     nobody with a hand-tuned size -- only by everybody with the default.
+
+     `MinimapZoneText` above is the client's string and zero rightly leaves it
+     alone. **These are ECO's own strings**: nothing else fonts them, so they
+     take the eleven the code always meant. ]==]
+cfg.zoneSize = 0
+map:ApplyMinimapHeader()
+map:RefreshMinimapHeader()
+
+GLOBAL_mapHolder = map:MinimapHeader()
+check(GLOBAL_mapHolder ~= nil, "the minimap header exists")
+
+check(GLOBAL_mapHolder.location and GLOBAL_mapHolder.location.text
+        and GLOBAL_mapHolder.location.text:GetFont() ~= nil,
+        "the zone line has a font at the shipped size of zero",
+        tostring(GLOBAL_mapHolder.location
+                and GLOBAL_mapHolder.location.text:GetFont()))
+
+eq(select(2, GLOBAL_mapHolder.location.text:GetFont()), 11,
+        "which is the eleven the fallback always meant",
+        tostring(select(2, GLOBAL_mapHolder.location.text:GetFont())))
+
+check(GLOBAL_mapHolder.clock and GLOBAL_mapHolder.clock.text
+        and GLOBAL_mapHolder.clock.text:GetFont() ~= nil,
+        "and so does the clock beside it")
+
+--[[ A size somebody did choose is still obeyed. ]]--
+cfg.zoneSize = 14
+map:RefreshMinimapHeader()
+eq(select(2, GLOBAL_mapHolder.location.text:GetFont()), 14,
+        "a chosen size is still used")
+
+--[[ And writing to it does not error, which is the failure the player saw:
+     `SetText` on a font string with no font takes the whole pass down. ]]--
+cfg.zoneSize = 0
+map:RefreshMinimapHeader()
+eq(pcall(GLOBAL_mapHolder.location.text.SetText,
+        GLOBAL_mapHolder.location.text, "Durotar"), true,
+        "and the zone line can be written to without erroring")
 
 cfg.zoneSize = 0
 
@@ -21195,11 +23434,26 @@ map:RefreshHeaderGlyphs()
 check(MinimapToggleButton:GetScript("OnEnter") ~= nil,
         "the map's button answers a hover")
 
-GameTooltip:ClearLines()
+--[==[ Opened over a tooltip that is already there, for the reason the drawer
+     button's hover is: clearing it by hand first is not what the game does,
+     and it hid a hover that appended to the last tooltip instead of starting
+     its own. ]==]
+Stub.itemIds["Close Neighbour"] = 200
+Stub.tooltips["item16"] = { "Close Neighbour" }
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 5)
+GameTooltip:Hide()
+
 MinimapToggleButton:GetScript("OnEnter")()
 eq(getglobal("GameTooltipTextLeft1"):GetText(), "Hide The Minimap",
         "saying which way it goes",
         tostring(getglobal("GameTooltipTextLeft1"):GetText()))
+eq(GameTooltip:NumLines(), 1, "and only that",
+        tostring(GameTooltip:NumLines()))
+Stub.tooltips["item16"] = nil
 
 MinimapToggleButton:GetScript("OnLeave")()
 
@@ -21255,12 +23509,32 @@ eq(GLOBAL_header.clock:GetBackdrop(), nil, "nor does the clock")
 check(EquadisClassicOverhaulMinimapToggle:GetScript("OnEnter") ~= nil,
         "the drawer button answers a hover")
 
-GameTooltip:ClearLines()
+--[==[ **Opened over a tooltip that is already there, deliberately.**
+
+     This used to clear the tooltip by hand first, which is not what happens in
+     the game and hid the fault: `SetOwner` does not empty a tooltip on this
+     client and neither does `Hide`, so a hover that opens with `AddLine`
+     appends to whatever was shown last. The client's own code always follows
+     `SetOwner` with `SetText`, which is the call that drops what was there.
+     Four places in this addon opened with `AddLine`; this is one. ]==]
+Stub.itemIds["Toggle Neighbour"] = 200
+Stub.tooltips["item16"] = { "Toggle Neighbour" }
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 5)
+GameTooltip:Hide()
+
 EquadisClassicOverhaulMinimapToggle:GetScript("OnEnter")()
 
 eq(getglobal("GameTooltipTextLeft1"):GetText(), "Addon Buttons",
         "with a tooltip that names it",
         tostring(getglobal("GameTooltipTextLeft1"):GetText()))
+
+eq(GameTooltip:NumLines(), 2, "and nothing underneath it",
+        tostring(GameTooltip:NumLines()))
+Stub.tooltips["item16"] = nil
 
 check(string.find(tostring(getglobal("GameTooltipTextLeft2"):GetText()),
         "gathered", 1, true) ~= nil,
@@ -22653,6 +24927,110 @@ check(GLOBAL_labels["Clear All In This Zone"] ~= nil, "and all of them")
 check(GLOBAL_labels["Waypoint Settings"] ~= nil,
         "and reach the settings, which is the other reason to right-click it")
 
+--[==[ **Choosing which mark the arrow points at.**
+
+     Ollie, 2026-09-29: *"add 'Set as Active Waypoint' should be an option"*.
+
+     `Active` took the first mark in the zone and kept it until it was cleared,
+     so with several down there was **no way to point at the second** except
+     deleting the first. The arrow answers "which way now", and that was a choice
+     the player could not make. ]==]
+way:Add(70, 30, "The Second One")
+GLOBAL_wayList = way:List("Elwynn Forest")
+eq(table.getn(GLOBAL_wayList), 2, "there are two marks in the zone")
+
+--[[ Cleared first: a mark chosen earlier in this section is still active, and
+     the point of the next line is what `Active` picks with nothing chosen. ]]--
+way:Deactivate()
+eq(way:Active(), GLOBAL_wayList[1], "the first is active to begin with")
+check(way:IsActive(GLOBAL_wayList[1]), "and knows it")
+check(not way:IsActive(GLOBAL_wayList[2]), "the second is not")
+
+check(way:SetActive(GLOBAL_wayList[2]), "the second can be made active")
+eq(way:Active(), GLOBAL_wayList[2], "and the arrow follows it")
+check(way:IsActive(GLOBAL_wayList[2]), "which it now reports")
+
+--[==[ **Only a mark in the zone the player is standing in.** The arrow is drawn
+     from the player to a point on this map; one in another zone has no
+     direction to give, and pointing at it would be a confident arrow at
+     nothing. ]==]
+way:Add(20, 20, "Elsewhere", "Durotar")
+
+--[[ Read after the add rather than before it: what is asserted is that a
+     *refused* SetActive changes nothing, not what adding to another zone does
+     to the arrow, which is a separate question with its own answer. ]]--
+GLOBAL_wayActive = way:Active()
+
+eq(way:SetActive(way:List("Durotar")[1]), false,
+        "a mark in another zone is refused")
+eq(way:Active(), GLOBAL_wayActive, "and the active one is left alone")
+eq(way:SetActive(nil), false, "as is nothing at all")
+eq(way:Active(), GLOBAL_wayActive, "which also changes nothing")
+
+--[==[ **The menu is about the mark it was opened on.**
+
+     It asked `Active()` whatever it had been opened from, so right-clicking the
+     *second* pin and choosing "Clear This Waypoint" cleared the **first** -- and
+     the menu even named the wrong one in its title. One mark in a zone cannot
+     show the difference, which is why it survived. ]==]
+way:SetActive(GLOBAL_wayList[1])
+
+GLOBAL_wayEntries = way:MenuItems(GLOBAL_wayList[2])
+eq(GLOBAL_wayEntries[1].text, "The Second One",
+        "a menu opened on a pin is titled with that pin's mark",
+        tostring(GLOBAL_wayEntries[1].text))
+
+GLOBAL_labels = {}
+for GLOBAL_i = 1, table.getn(GLOBAL_wayEntries) do
+    GLOBAL_labels[GLOBAL_wayEntries[GLOBAL_i].text] = GLOBAL_wayEntries[GLOBAL_i]
+end
+
+check(GLOBAL_labels["Set as Active Waypoint"] ~= nil,
+        "and offers to point the arrow at it")
+
+GLOBAL_labels["Set as Active Waypoint"].func()
+eq(way:Active(), GLOBAL_wayList[2], "which is what clicking it does")
+
+--[[ Not offered on the mark already being pointed at: a button that changes
+     nothing is worse than no button. ]]--
+GLOBAL_wayEntries = way:MenuItems(GLOBAL_wayList[2])
+GLOBAL_labels = {}
+for GLOBAL_i = 1, table.getn(GLOBAL_wayEntries) do
+    GLOBAL_labels[GLOBAL_wayEntries[GLOBAL_i].text] = GLOBAL_wayEntries[GLOBAL_i]
+end
+check(GLOBAL_labels["Set as Active Waypoint"] == nil,
+        "and is not offered on the one already active")
+
+--[[ Clearing acts on the mark the menu was opened on, not on the active one. ]]--
+way:SetActive(GLOBAL_wayList[1])
+GLOBAL_wayEntries = way:MenuItems(GLOBAL_wayList[2])
+for GLOBAL_i = 1, table.getn(GLOBAL_wayEntries) do
+    if GLOBAL_wayEntries[GLOBAL_i].text == "Clear This Waypoint" then
+        GLOBAL_wayEntries[GLOBAL_i].func()
+    end
+end
+
+eq(table.getn(way:List("Elwynn Forest")), 1,
+        "clearing from a pin removes that pin's mark")
+eq(way:List("Elwynn Forest")[1].name, "The Vendor",
+        "and leaves the other one standing",
+        tostring(way:List("Elwynn Forest")[1].name))
+
+way:ClearAll()
+way:Add(45, 60, "The Vendor")
+way:ApplyArrow()
+
+--[[ Re-opened from the **arrow**, so the menu is about the active mark again.
+     A dropdown remembers the frame it was opened from -- that is the whole
+     point of the change above -- so leaving it pointed at a pin would have the
+     next click act on a mark that no longer exists. ]]--
+way:ShowMenu(way:ArrowFrame())
+GLOBAL_entries = Stub.OpenMenu(GLOBAL_menu)
+GLOBAL_labels = {}
+for GLOBAL_i = 1, table.getn(GLOBAL_entries) do
+    GLOBAL_labels[GLOBAL_entries[GLOBAL_i].text] = GLOBAL_entries[GLOBAL_i]
+end
+
 --[[ And the entries do what they say. ]]--
 GLOBAL_labels["Clear This Waypoint"].func()
 eq(way:Active(), nil, "clearing this one deactivates it")
@@ -23798,12 +26176,57 @@ eq(GLOBAL_rel, GLOBAL_target, "which is the frame itself")
 check(GLOBAL_outline:GetFrameLevel() > GLOBAL_target:GetFrameLevel(),
         "and drawn above it")
 
---[[ **Only over something on screen.** An outline round a hidden pet bar is a
-     rectangle floating over the world with nothing in it, and it is the first
-     thing anybody would try to drag. ]]--
+--[==[ **Inactive is not the same as off.**
+
+     Ollie, 2026-09-30: *"editmode should show inactive (but not disabled)
+     moveboxes"*.
+
+     This used to assert that a hidden frame is never outlined, guarding against
+     "a rectangle floating over the world with nothing in it". That is right for
+     a feature somebody switched off and wrong for one that simply has nothing
+     to say this second -- a cast bar between casts, combo points at zero, an
+     off-hand bar on a character holding one weapon. All enabled, all invisible,
+     and all impossible to position, which is the one thing edit mode is for.
+
+     The two are told apart by which unlock registered the frame: only an
+     enabled module is asked to unlock, and unlocking is what registers. ]==]
 GLOBAL_target:Hide()
 OB.ShowOutlines(true)
-check(not GLOBAL_outline:IsShown(), "a hidden frame is not outlined")
+
+check(GLOBAL_outline:IsShown(),
+        "a frame that is merely inactive is still outlined")
+eq(GLOBAL_outline:GetAlpha(), 0.4,
+        "faintly, so the two states are still told apart",
+        tostring(GLOBAL_outline:GetAlpha()))
+
+--[[ And solid again once it has something to draw. ]]--
+GLOBAL_target:Show()
+OB.ShowOutlines(true)
+check(GLOBAL_outline:IsShown(), "a frame that is drawing is outlined")
+eq(GLOBAL_outline:GetAlpha(), 1, "at full strength")
+
+--[==[ **A frame from an earlier unlock is left alone.** A module switched off
+     keeps its entry -- nothing unregisters -- so the stamp going stale is what
+     stops a window appearing for a feature the reader turned off. That was the
+     original reason for the rule, and it still holds where it applies. ]==]
+GLOBAL_target:Hide()
+GLOBAL_movableEntry = nil
+for GLOBAL_i = 1, table.getn(OB.movables) do
+    if OB.movables[GLOBAL_i].frame == GLOBAL_target then
+        GLOBAL_movableEntry = OB.movables[GLOBAL_i]
+    end
+end
+
+check(GLOBAL_movableEntry ~= nil, "the frame is registered")
+GLOBAL_movableEntry.generation = -1
+
+OB.ShowOutlines(true)
+check(not GLOBAL_outline:IsShown(),
+        "a hidden frame nothing unlocked this time is not outlined")
+
+GLOBAL_movableEntry.generation = OB.editGeneration
+GLOBAL_target:Show()
+OB.ShowOutlines(true)
 
 GLOBAL_target:Show()
 OB.ShowOutlines(true)
@@ -24110,19 +26533,28 @@ Stub.items[8104] = { name = "Elixir of the Mongoose", rarity = 1, maxStack = 5,
         itemType = "Consumable", subType = "Potion" }
 Stub.items[8105] = { name = "Sunder Plate", rarity = 3, maxStack = 1,
         itemType = "Armor", subType = "Plate", equipLoc = "INVTYPE_CHEST" }
-Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1 }
-Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20 }
+--[[ Typed, because what kind of thing an item is now decides where it
+     goes. Untyped, the stub answers "Miscellaneous" -- so a legendary
+     weapon sorted as junk and these fixtures proved nothing about the
+     ranking they were written to prove. ]]--
+Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1,
+        itemType = "Weapon", subType = "Two-Handed Maces",
+        equipLoc = "INVTYPE_2HWEAPON" }
+Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20,
+        itemType = "Consumable", subType = "Food & Drink" }
 Stub.itemIds["Elixir of the Mongoose"] = 8104
 Stub.itemIds["Sunder Plate"] = 8105
 Stub.itemIds["Sulfuras"] = 8102
 Stub.itemIds["Tough Jerky"] = 8103
 
+--[[ Exactly backwards, so every item has somewhere else to be and the two
+     swaps it takes are on four slots that do not overlap. ]]--
 Stub.bags = {}
 Stub.SetBag(0, { slots = 4,
     [1] = { name = "Tough Jerky", quality = 1, count = 5 },
-    [2] = { name = "Sunder Plate", quality = 3, count = 1 },
-    [3] = { name = "Sulfuras", quality = 5, count = 1 },
-    [4] = { name = "Elixir of the Mongoose", quality = 1, count = 1 },
+    [2] = { name = "Elixir of the Mongoose", quality = 1, count = 1 },
+    [3] = { name = "Sunder Plate", quality = 3, count = 1 },
+    [4] = { name = "Sulfuras", quality = 5, count = 1 },
 })
 Stub.SettleBags()
 bags.sortMoves = 0
@@ -24133,14 +26565,20 @@ eq(bags.sortMoves, 2, "and it sends two moves at once, on four different slots",
 check(bags.touched["0:1"] and bags.touched["0:3"] and bags.touched["0:2"] and bags.touched["0:4"],
         "every slot it touched is remembered as in flight")
 
+--[[ And that was all of it: two swaps on four slots, none of them waiting on
+     another, so the next pass has nothing left to do. ]]--
 Stub.SettleBags()
-eq(bags:SortStep(), true, "the next pass sends what was left")
-Stub.SettleBags()
-eq(bags:SortStep(), false, "and then the bag is in order")
-eq(Stub.bags[0][1].name, "Sulfuras", "the epic first")
-eq(Stub.bags[0][2].name, "Tough Jerky", "the jerky second")
-eq(Stub.bags[0][3].name, "Elixir of the Mongoose", "the elixir third")
-eq(Stub.bags[0][4].name, "Sunder Plate", "and the plate last")
+eq(bags:SortStep(), false, "and one pass settles it")
+--[==[ **Kind first, and kind is a ranking rather than the alphabet.**
+
+     Weapon, then armour, then the two consumables -- and within those,
+     "Potion" before "Food & Drink". This used to read Sulfuras, jerky, elixir,
+     plate: the class names compared as *strings*, descending, which put a
+     legendary weapon's owner's plate helm behind a stick of dried meat. ]==]
+eq(Stub.bags[0][1].name, "Sulfuras", "the weapon first")
+eq(Stub.bags[0][2].name, "Sunder Plate", "then the armour")
+eq(Stub.bags[0][3].name, "Elixir of the Mongoose", "then the potion")
+eq(Stub.bags[0][4].name, "Tough Jerky", "and the food after it")
 
 Stub.items[8104], Stub.items[8105], Stub.items[8102], Stub.items[8103] = nil, nil, nil, nil
 Stub.itemIds["Elixir of the Mongoose"], Stub.itemIds["Sunder Plate"] = nil, nil
@@ -24174,8 +26612,15 @@ eq(bags:SortStep(), false, "a favourite stays in the slot it was put in")
 --[[ All three in the catalogue, so "kind" -- the first key -- compares equal
      and what is being watched is the quality order and the gap closing. ]]--
 Stub.items[8001] = { name = "Rune Thread", rarity = 1, maxStack = 20 }
-Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1 }
-Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20 }
+--[[ Typed, because what kind of thing an item is now decides where it
+     goes. Untyped, the stub answers "Miscellaneous" -- so a legendary
+     weapon sorted as junk and these fixtures proved nothing about the
+     ranking they were written to prove. ]]--
+Stub.items[8102] = { name = "Sulfuras", rarity = 5, maxStack = 1,
+        itemType = "Weapon", subType = "Two-Handed Maces",
+        equipLoc = "INVTYPE_2HWEAPON" }
+Stub.items[8103] = { name = "Tough Jerky", rarity = 1, maxStack = 20,
+        itemType = "Consumable", subType = "Food & Drink" }
 Stub.itemIds["Rune Thread"] = 8001
 Stub.itemIds["Sulfuras"] = 8102
 Stub.itemIds["Tough Jerky"] = 8103
@@ -24361,8 +26806,8 @@ eq(GLOBAL_piles["Elixir of the Mongoose"], 1, "and the elixir", GLOBAL_walkText)
      the plate again. ]]--
 Stub.SetBag(0, { slots = 4,
     [1] = { name = "Sunder Plate", quality = 3, count = 1 },
-    [2] = { name = "Sulfuras", quality = 5, count = 1 },
-    [3] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [2] = { name = "Tough Jerky", quality = 1, count = 5 },
+    [3] = { name = "Sulfuras", quality = 5, count = 1 },
 })
 Stub.SetBag(1, { slots = 4 })
 Stub.SetBag(2, { slots = 4 })
@@ -24404,11 +26849,10 @@ for GLOBAL_b = 0, 2 do
     end
 end
 GLOBAL_walkText = table.concat(GLOBAL_walk, " | ")
---[[ Kind first, descending: the two miscellaneous items before the armour,
-     and the epic before the jerky within them. ]]--
-eq(GLOBAL_walk[1], "0:Sulfuras", "the epic is first", GLOBAL_walkText)
-eq(GLOBAL_walk[2], "0:Tough Jerky", "the jerky second", GLOBAL_walkText)
-eq(GLOBAL_walk[3], "0:Sunder Plate", "the plate third", GLOBAL_walkText)
+--[[ Kind first: the weapon, then the armour, then what you eat. ]]--
+eq(GLOBAL_walk[1], "0:Sulfuras", "the weapon is first", GLOBAL_walkText)
+eq(GLOBAL_walk[2], "0:Sunder Plate", "the armour second", GLOBAL_walkText)
+eq(GLOBAL_walk[3], "0:Tough Jerky", "the food third", GLOBAL_walkText)
 eq(GLOBAL_walk[4], "0:-", "and nothing after them", GLOBAL_walkText)
 
 for GLOBAL_b = 0, 4 do Stub.SetBag(GLOBAL_b, nil) end
@@ -24456,8 +26900,10 @@ eq(bags:RowName({ link = Stub.ItemLink("Copper Bar", 1) }), "Copper Bar",
      answers in one and the code never compares against a literal. ]]--
 Stub.itemIds["Fine Bread"] = 6001
 Stub.itemIds["Plain Bread"] = 6002
+Stub.itemIds["Plattenhelm"] = 6003
 Stub.items[6001] = { name = "Fine Bread", rarity = 3 }
 Stub.items[6002] = { name = "Plain Bread", rarity = 1 }
+Stub.items[6003] = { name = "Plattenhelm", rarity = 4 }
 
 GLOBAL_realGetItemInfo = GetItemInfo
 
@@ -24481,6 +26927,17 @@ function GetItemInfo(item)
         return "Thunderfury", "item:9999:0:0:0", 5, 80, "Waffe", "Schwert",
                 1, "INVTYPE_WEAPONMAINHAND", "tex-tf"
     end
+    --[==[ **The pair that tells the two orders apart.**
+
+         Alphabetically "Verbrauchbar" beats "Ruestung", so a string compare
+         puts bread in front of plate armour. By rank, Armor is the client's
+         second class and Consumable its fourth, so the armour leads. Every
+         other pair in this block happens to agree; this one does not, which is
+         what makes it the assertion worth having. ]==]
+    if id == 6003 then
+        return "Plattenhelm", "item:6003:0:0:0", 4, 60, "Ruestung", "Platte",
+                1, "INVTYPE_HEAD", "tex-helm"
+    end
     if id == 6001 then
         return "Fine Bread", "item:6001:0:0:0", 3, 5, "Verbrauchbar", "Essen",
                 20, "", "tex-bread"
@@ -24497,19 +26954,60 @@ GLOBAL_arrow = { link = Stub.ItemLink("Arrow", 1), id = 7777, count = 200 }
 GLOBAL_bread = { link = Stub.ItemLink("Bread", 1), id = 8888, count = 5 }
 GLOBAL_sword = { link = Stub.ItemLink("Thunderfury", 4), id = 9999, count = 1 }
 
---[[ Kind first, and descending -- Waffe before Geschoss before Verbrauchbar.
-     Nothing here compares against an English word, which is the whole reason the
-     stub answers in German. ]]--
+--[==[ **Which kind leads is not an accident of the language, and it used to
+     be.**
+
+     The note that stood here said *"**Which** kind leads is an accident of the
+     client's language and nothing here should care -- what the key buys is that
+     every weapon ends up beside every other weapon."* That was the bug,
+     written down and defended: the class name was compared as a **string**, so
+     on an English client the order came out Weapon, Trade Goods, Recipe,
+     Quest, Projectile, Miscellaneous, Key, Container, Consumable, Armor -- the
+     alphabet, backwards, with an epic helm behind the vendor trash.
+
+     The rank is read off `GetAuctionItemClasses`, which answers the ten classes
+     in one fixed order in every language. So this fixture speaks German
+     throughout -- both the item classes and the auction list -- and the order
+     that comes out is still weapon, then food, then arrows. ]==]
+Stub.itemClasses[1].name = "Waffe"            -- Weapon
+Stub.itemClasses[2].name = "Ruestung"         -- Armor
+Stub.itemClasses[3].name = "Behaelter"        -- Container
+Stub.itemClasses[4].name = "Verbrauchbar"     -- Consumable
+Stub.itemClasses[5].name = "Handelswaren"     -- Trade Goods
+Stub.itemClasses[6].name = "Geschoss"         -- Projectile
+Stub.itemClasses[7].name = "Koecher"          -- Quiver
+Stub.itemClasses[8].name = "Rezept"           -- Recipe
+Stub.itemClasses[9].name = "Reagenz"          -- Reagent
+Stub.itemClasses[10].name = "Verschiedenes"   -- Miscellaneous
+
+bags.classRanks = nil
+
 check(bags:OrderBefore(GLOBAL_sword, GLOBAL_arrow),
         "what kind of thing it is comes first")
---[[ Descending on the display string: Waffe, then Verbrauchbar, then
-     Geschoss. *Which* kind leads is an accident of the client's language and
-     nothing here should care -- what the key buys is that every weapon ends up
-     beside every other weapon. ]]--
+
+--[==[ **Alphabetically "Verbrauchbar" beats "Geschoss", and it must not win
+     here.** Consumables outrank projectiles because the client lists them
+     fourth and sixth, which is true whatever they are called. ]==]
 check(bags:OrderBefore(GLOBAL_bread, GLOBAL_arrow),
-        "and it runs descending, as every one of Bagnon's keys does")
+        "food comes before arrows because the client ranks it so")
 check(not bags:OrderBefore(GLOBAL_arrow, GLOBAL_bread),
         "which is an order rather than a coin toss")
+
+--[[ And the sword leads both, which the alphabet would also have given -- so
+     it is not this one that carries the proof. ]]--
+check(bags:OrderBefore(GLOBAL_sword, GLOBAL_bread),
+        "and the weapon leads them both")
+
+--[==[ **Here is the pair the alphabet gets wrong.** "Verbrauchbar" sorts above
+     "Ruestung" as a string, so the old compare put bread in front of a plate
+     helm -- which is the English bug in another language: armour behind food.
+     By rank it is the client's second class against its fourth. ]==]
+GLOBAL_helm = { link = Stub.ItemLink("Plattenhelm", 4), id = 6003, count = 1 }
+
+check(bags:OrderBefore(GLOBAL_helm, GLOBAL_bread),
+        "armour leads food, which the alphabet would have got backwards")
+check(not bags:OrderBefore(GLOBAL_bread, GLOBAL_helm),
+        "and only that way round")
 
 GLOBAL_fine = { link = Stub.ItemLink("Fine Bread", 3), id = 6001, count = 1 }
 GLOBAL_plain = { link = Stub.ItemLink("Plain Bread", 1), id = 6002, count = 1 }
@@ -24531,7 +27029,17 @@ check(not bags:OrderBefore(GLOBAL_bread, GLOBAL_bread),
      something like twelve hundred comparisons, and `GetItemInfo` on every one
      of them is a pause somebody can feel. ]]--
 GLOBAL_keys = bags:SortKeys(GLOBAL_sword)
-eq(GLOBAL_keys.class, "Waffe", "the keys are read off the client")
+
+--[==[ **A rank, not a name.** Counted from the bottom so that "bigger is
+     earlier" is true of this key as it is of every other one, which is what
+     lets the comparison stay uniformly descending. Weapon is second of the
+     twelve, so it is one below the top. ]==]
+eq(GLOBAL_keys.kind, bags:ClassKind("Waffe"),
+        "the kind key is the rank of what the client called it",
+        tostring(GLOBAL_keys.kind))
+check(GLOBAL_keys.kind > bags:ClassKind("Verschiedenes"),
+        "and a weapon outranks junk",
+        GLOBAL_keys.kind .. " vs " .. bags:ClassKind("Verschiedenes"))
 eq(GLOBAL_keys.quality, 5, "including the quality")
 eq(GLOBAL_keys.equip, "INVTYPE_WEAPONMAINHAND", "and where it is worn")
 
@@ -24539,6 +27047,22 @@ eq(bags:SortKeys({ empty = true }).quality, 0,
         "an empty slot answers with nothing rather than with nil")
 
 GetItemInfo = GLOBAL_realGetItemInfo
+
+--[[ English again, and the rank cache with it: every later fixture here names
+     its classes in English, and a cache built from German would rank none of
+     them. ]]--
+Stub.itemClasses[1].name = "Weapon"
+Stub.itemClasses[2].name = "Armor"
+Stub.itemClasses[3].name = "Container"
+Stub.itemClasses[4].name = "Consumable"
+Stub.itemClasses[5].name = "Trade Goods"
+Stub.itemClasses[6].name = "Projectile"
+Stub.itemClasses[7].name = "Quiver"
+Stub.itemClasses[8].name = "Recipe"
+Stub.itemClasses[9].name = "Reagent"
+Stub.itemClasses[10].name = "Miscellaneous"
+
+bags.classRanks = nil
 
 -- ---------------------------------------------------------------------------
 -- the grid is a picture of the bags
@@ -24912,7 +27436,7 @@ Stub.SetBag(0, { slots = 4, [1] = { name = "Bread", quality = 1, count = 5 } })
 bags:Sort()
 
 GLOBAL_said = table.concat(Stub.chat, " ")
-check(string.find(GLOBAL_said, "quality", 1, true) ~= nil,
+check(string.find(GLOBAL_said, "rarity", 1, true) ~= nil,
         "the order is said out loud", GLOBAL_said)
 check(string.find(GLOBAL_said, "kind", 1, true) ~= nil,
         "naming the keys it used", GLOBAL_said)
@@ -25215,11 +27739,105 @@ for GLOBAL_i = 1, 10 do
     event = nil
 end
 PickupContainerItem = GLOBAL_refusePickup
-check(not bags.sorting, "a refused move ends the run")
-check((bags.sortMoves or 0) <= 2, "after at most one repeat",
+check((bags.sortMoves or 0) == 0, "a client that lifts nothing moves nothing",
         tostring(bags.sortMoves))
-check(string.find(table.concat(Stub.chat, " | "), "refused a move", 1, true) ~= nil,
-        "and says so, with the slot", table.concat(Stub.chat, " | "))
+
+--[[ And the run does not spin on it: a slot that will not come up is a
+     wait, and the wait is bounded. ]]--
+for GLOBAL_i = 1, MAX_WAIT_DRIVES or 80 do
+    if not bags.sorting then break end
+    Stub.Tick(0.2)
+end
+check(not bags.sorting, "and the run gives up after its bounded wait",
+        tostring(bags.sortWaits))
+
+--[==[ **A move is judged by the cursor, not by the shape of the bags.**
+
+     The run used to compare the bags before and after a pass and call "no
+     change" a refusal. That reads the same for a move the client ignored,
+     a move that has not landed yet, and a pass whose moves cancelled --
+     and in game it fired constantly: *stopped: the client refused a move*,
+     on every attempt, with the bags half sorted.
+
+     Now `Move` asks the cursor. Nothing lifted means the slot would not
+     come up, which is a wait; something still held after the drop means
+     the goal would not take it, which is that pair refused and no other.
+     The item goes back where it came from either way. ]==]
+Stub.bags = {}
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Bread", quality = 1, count = 5 },
+    [3] = { name = "Arrow", quality = 1, count = 5 },
+})
+Stub.SettleBags()
+
+--[[ A client that will not lift anything: nothing is dropped either, so
+     nothing ends up in the wrong slot. ]]--
+GLOBAL_realPickup2 = PickupContainerItem
+PickupContainerItem = function(bag, slot) end
+
+bags.sortMoves = 0
+eq(bags:Move({ bag = 0, slot = 3 }, { bag = 0, slot = 1 }), "stuck",
+        "a slot that will not lift is stuck, not refused")
+eq(bags.sortMoves or 0, 0, "and is not counted as a move")
+
+--[[ A client that lifts but will not drop: the item goes home, the pair is
+     remembered, and the run carries on with everything else. ]]--
+PickupContainerItem = function(bag, slot)
+    if not Stub.cursor then
+        local b = Stub.bags[bag]
+        if b and b[slot] then Stub.cursor = { item = b[slot], bag = bag, slot = slot } end
+    end
+end
+
+bags.sortMoves = 0
+eq(bags:Move({ bag = 0, slot = 3 }, { bag = 0, slot = 1 }), "refused",
+        "a goal that will not take it is refused")
+eq(bags.sortMoves or 0, 0, "and is not counted either")
+check(not CursorHasItem(), "with nothing left on the cursor")
+
+PickupContainerItem = GLOBAL_realPickup2
+Stub.cursor = nil
+Stub.SettleBags()
+
+--[==[ **And a refused pair is asked for once.** The whole run used to end on
+     the first refusal; now the pair is skipped and the rest of the bags are
+     sorted, with one line at the end saying how many the client would not
+     move. ]==]
+Stub.bags = {}
+Stub.SetBag(0, { slots = 4,
+    [1] = { name = "Bread", quality = 1, count = 5 },
+    [3] = { name = "Arrow", quality = 1, count = 5 },
+})
+Stub.SettleBags()
+
+GLOBAL_asked = 0
+PickupContainerItem = function(bag, slot)
+    if not Stub.cursor then
+        local b = Stub.bags[bag]
+        if b and b[slot] then
+            GLOBAL_asked = GLOBAL_asked + 1
+            Stub.cursor = { item = b[slot], bag = bag, slot = slot }
+        end
+    end
+end
+
+Stub.chat = {}
+bags:Sort()
+for GLOBAL_i = 1, 20 do
+    if not bags.sorting then break end
+    Stub.Tick(0.2)
+    Stub.SettleBags()
+end
+PickupContainerItem = GLOBAL_realPickup2
+Stub.cursor = nil
+
+check(not bags.sorting, "a run against a client that refuses everything ends")
+check(GLOBAL_asked <= 8, "having asked for each pair about once",
+        tostring(GLOBAL_asked))
+check(string.find(table.concat(Stub.chat, " | "), "would not move", 1, true) ~= nil,
+        "and says how many it would not move", table.concat(Stub.chat, " | "))
+check(string.find(table.concat(Stub.chat, " | "), "refused a move", 1, true) == nil,
+        "without the old line", table.concat(Stub.chat, " | "))
 
 Stub.items[7777], Stub.items[8888], Stub.items[9001] = nil, nil, nil
 Stub.itemIds["Arrow"], Stub.itemIds["Bread"] = nil, nil
@@ -25935,6 +28553,107 @@ check(GLOBAL_idb:KnownInstances() == GLOBAL_cachedList,
 AtlasCFM.InstanceData.ECOTESTINSTANCE = nil
 eq(table.getn(GLOBAL_idb:KnownInstances()), GLOBAL_knownBefore,
         "and one going away is noticed too")
+
+--[==[ **Two mounts that no longer drop are out of the drop tables.**
+
+     Ollie, 2026-09-24: "remove onyxian drake and riding scorpid from drop
+     tables. its outdated", then "remove all scorpid mounts, dark, black,
+     beige, etc.". The inherited pfQuest data still listed the Onyxian Drake
+     (30017) and **every scorpid mount, 30019 through 30026** -- 3,833 rows
+     across the mobs and objects of the whole world, most of them hundredths of
+     a percent, so they turned up on tooltips everywhere for something nobody
+     can get that way any more.
+
+     **30019-30026 is the whole of the block**, checked against the server's own
+     item list: every other item with "Scorpid" in its name is armour, a trade
+     good, food or a quest item -- Scorpid Scale, Tough Scorpid Breastplate,
+     Scorpid Surprise. None of those are touched, and the assertion below is
+     there so a later sweep on the word cannot take them.
+
+     The **names stay**. A name is not a claim that anything drops it, and
+     taking them out would blank the item everywhere else it is mentioned. ]==]
+GLOBAL_lootDb = GLOBAL_idb:EmbeddedDB()
+check(GLOBAL_lootDb ~= nil, "the shipped loot database is loaded")
+
+GLOBAL_goneIds = { [30017] = "Onyxian Drake", [30019] = "Beige Riding Scorpid",
+        [30020] = "Black Riding Scorpid", [30021] = "Blue Riding Scorpid",
+        [30022] = "Dark Iron Scorpid", [30023] = "Golden Riding Scorpid",
+        [30024] = "Red Riding Scorpid", [30025] = "Silver Riding Scorpid",
+        [30026] = "Desert Riding Scorpid" }
+
+function GLOBAL_CountGone(rows)
+    local found, where = 0, nil
+    for unit, packed in pairs(rows or {}) do
+        for i = 1, table.getn(packed), 2 do
+            if GLOBAL_goneIds[packed[i]] then
+                found = found + 1
+                where = where or (GLOBAL_goneIds[packed[i]] .. " still on " .. tostring(unit))
+            end
+        end
+    end
+    return found, where
+end
+
+GLOBAL_gone, GLOBAL_goneWhere = GLOBAL_CountGone(GLOBAL_lootDb.units)
+eq(GLOBAL_gone, 0, "no mob drops them any more", tostring(GLOBAL_goneWhere))
+
+GLOBAL_gone, GLOBAL_goneWhere = GLOBAL_CountGone(GLOBAL_lootDb.objects)
+eq(GLOBAL_gone, 0, "and no object holds one", tostring(GLOBAL_goneWhere))
+
+--[==[ **And nothing else went with them.** Unit 6 carried the Onyxian Drake at
+     2.5% as the last entry of a twelve-item list; the other eleven are the
+     point of this assertion, because a removal that takes the row apart is
+     worse than the row it was fixing. ]==]
+check(table.getn(GLOBAL_lootDb.units[6]) >= 22,
+        "a mob that carried one keeps the rest of its drops",
+        tostring(table.getn(GLOBAL_lootDb.units[6]) / 2) .. " drops")
+check(math.mod(table.getn(GLOBAL_lootDb.units[6]), 2) == 0,
+        "in whole id/chance pairs")
+
+--[[ The count in the header is the count in the table. ]]--
+GLOBAL_edges = 0
+for _, packed in pairs(GLOBAL_lootDb.units) do
+    GLOBAL_edges = GLOBAL_edges + (table.getn(packed) / 2)
+end
+for _, packed in pairs(GLOBAL_lootDb.objects) do
+    GLOBAL_edges = GLOBAL_edges + (table.getn(packed) / 2)
+end
+eq(GLOBAL_edges, GLOBAL_lootDb.edgeCount, "and the header's count still matches",
+        tostring(GLOBAL_edges) .. " vs " .. tostring(GLOBAL_lootDb.edgeCount))
+
+--[[ Kept: the name, which is what a tooltip or a search shows for an item that
+     exists and simply is not dropped. ]]--
+check(GLOBAL_idb:OctoItemDB() == nil
+        or GLOBAL_idb:OctoItemDB().names[30017] == "Onyxian Drake",
+        "the item is still named, it is only no longer a drop")
+
+--[==[ **And the scorpids that are not mounts are all still dropped.**
+
+     "Scorpid" is a whole family of ordinary loot -- leatherworking scale, the
+     Tough and Heavy armour sets, Scorpid Surprise, quest samples. A removal
+     done on the word rather than on the eight ids would have taken every one
+     of them, so this asserts the three most-used are still on something. ]==]
+function GLOBAL_DropSources(itemId)
+    local found = 0
+    for _, packed in pairs(GLOBAL_lootDb.units) do
+        for i = 1, table.getn(packed), 2 do
+            if packed[i] == itemId then found = found + 1 end
+        end
+    end
+    return found
+end
+
+--[[ Witnesses that really are mob drops. The leatherworking scales are **not**
+     -- 8154 and 15408 have no unit sources in this database and never did,
+     because they are skinned rather than looted, and pfQuest keeps that
+     elsewhere. Checked against the pre-removal file rather than assumed, after
+     they were picked as witnesses here and read as a regression. ]]--
+check(GLOBAL_DropSources(5466) > 0, "the Scorpid Stinger is still dropped",
+        tostring(GLOBAL_DropSources(5466)) .. " sources")
+check(GLOBAL_DropSources(19934) > 0, "so is the Large Scorpid Claw",
+        tostring(GLOBAL_DropSources(19934)) .. " sources")
+check(GLOBAL_DropSources(4862) > 0, "and the Scorpid Worker Tail",
+        tostring(GLOBAL_DropSources(4862)) .. " sources")
 
 context = "item filters: "
 
@@ -27948,6 +30667,13 @@ Stub.player.targetsTarget = nil
 cfg.showCombo = true
 Stub.player.combo = 3
 
+--[[ As a rogue, in combat: the two states the row is drawn in at all since
+     v0.99.323. Both are asserted in their own right further down. ]]--
+GLOBAL_plateComboClass = OB.class
+GLOBAL_plateComboCombat = OB.inCombat
+OB.class = "ROGUE"
+OB.inCombat = true
+
 --[==[ **Five sockets, filling as the points come.** The target's plate shows
      all five empty rings and lights an orb in each earned one -- what the
      target frame does, and what "the points aren't stacking" meant. ]==]
@@ -28037,6 +30763,80 @@ Stub.player.combo = 0
 cfg.showCombo = false
 plates:Refresh(adoptedEnemy)
 eq(adoptedEnemy.combo[1].shown, false, "and switched off means none")
+
+--[==[ **And only for a class that earns them.**
+
+     Hiding the option row was never the same as not drawing them. The setting
+     arrives from a shared profile as easily as from the panel, and
+     `GetComboPoints` answers **0** rather than nothing for a class with none --
+     so with the empty sockets of v0.99.309 switched on, a warrior wore five
+     empty rings under every target it had for the rest of the session. The
+     draw asked only `istarget and showCombo`; now it asks the same question
+     the option row and the combo point bar ask.
+
+     Rogues and druids: a druid in cat form earns combo points the way a rogue
+     does. ]==]
+cfg.showCombo = true
+cfg.comboSockets = true
+Stub.player.combo = 3
+
+OB.class = "ROGUE"
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, true, "a rogue's target shows the sockets")
+eq(adoptedEnemy.comboOrbs[3].shown, true, "and the points it has earned")
+
+--[==[ **A druid gets none of it, by instruction.** Ollie, 2026-09-24: "rogue
+     only... should not show for any other class". A druid in cat form does
+     earn combo points, so this is a decision rather than a consequence --
+     `OB.comboClasses` in core.lua is the one place to undo it. ]==]
+OB.class = "DRUID"
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, false, "a druid's target shows none")
+
+OB.class = "WARRIOR"
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, false,
+        "a warrior's target shows no empty sockets")
+eq(adoptedEnemy.comboOrbs[1].shown, false, "and nothing lit")
+
+--[[ A mage with the setting on is the shared-profile case, and reads the
+     same. ]]--
+OB.class = "MAGE"
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[5].shown, false, "nor a mage's, however the setting got set")
+
+--[==[ **The option row and the drawing cannot drift apart**, because they ask
+     one function. The row was already hidden for these classes while the
+     drawing went ahead, which is exactly how this survived. ]==]
+eq(OB.predicates.plates_no_combo(), true, "the option row is hidden for a mage")
+OB.class = "ROGUE"
+eq(OB.predicates.plates_no_combo(), false, "and offered to a rogue")
+eq(OB.HasComboPoints(), true, "which is the one answer both of them take")
+
+--[==[ **And they go out of combat.** Points earned in a fight sit on the plate
+     after it ends, so out of combat the row is showing the last pull. Read off
+     `OB.inCombat`, which the core `PLAYER_REGEN_*` handlers maintain, so the
+     plate and the HUD bar change at the same instant. ]==]
+GLOBAL_comboCombat = OB.inCombat
+OB.inCombat = true
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, true, "in combat a rogue sees the sockets")
+
+OB.inCombat = false
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, false, "out of combat they go")
+eq(adoptedEnemy.comboOrbs[1].shown, false, "orbs and all")
+
+cfg.comboHideOutOfCombat = false
+plates:Refresh(adoptedEnemy)
+eq(adoptedEnemy.combo[1].shown, true, "unless the switch says otherwise")
+cfg.comboHideOutOfCombat = true
+OB.inCombat = GLOBAL_plateComboCombat
+OB.class = GLOBAL_plateComboClass
+
+Stub.player.combo = 0
+cfg.showCombo = false
+plates:Refresh(adoptedEnemy)
 
 -- ---------------------------------------------------------------------------
 -- cast bars, which are the one thing here that is not target-only
@@ -28182,6 +30982,31 @@ event, arg1 = "CHAT_MSG_COMBAT_HOSTILE_DEATH", "Bloodscalp Berserker dies."
 OB.casts:OnEvent()
 
 eq(OB.CastInfo("Bloodscalp Berserker"), nil, "and dying ends it")
+
+--[==[ **And dying at your own hand ends it too, which it did not.**
+
+     This list held `UNITDIESOTHER` and `UNITDESTROYEDOTHER` and stopped there.
+     The client prints "You have slain %s!" for anything **you** kill -- most of
+     what anybody kills -- and that sentence matched nothing, so the single most
+     common death in the game left the cast bar running until it timed out.
+
+     Found while giving the aura store the same list: both have to know when
+     something died, and there is one answer to what that looks like now. ]==]
+OB.StartCast("Bloodscalp Berserker", "Fireball")
+
+event, arg1 = "CHAT_MSG_COMBAT_HOSTILE_DEATH",
+        "You have slain Bloodscalp Berserker!"
+OB.casts:OnEvent()
+
+eq(OB.CastInfo("Bloodscalp Berserker"), nil, "killing it yourself ends it")
+
+OB.StartCast("Bloodscalp Berserker", "Fireball")
+
+event, arg1 = "CHAT_MSG_COMBAT_HOSTILE_DEATH",
+        "Bloodscalp Berserker is slain by Sylvie!"
+OB.casts:OnEvent()
+
+eq(OB.CastInfo("Bloodscalp Berserker"), nil, "and so does somebody else killing it")
 
 OB.StartCast("Bloodscalp Berserker", "Fireball")
 OB.StartCast("Bloodscalp Shaman", "Healing Wave")
@@ -29038,6 +31863,362 @@ check(not GLOBAL_plateTimer:IsShown(), "and the numbers are gone")
 cfg.debuffTimers = true
 OB.auras = {}
 
+-- ---------------------------------------------------------------------------
+-- a yellow mob that has turned on you is a red one
+-- ---------------------------------------------------------------------------
+
+--[==[ **The bar says what faction it is; the unit says what it is doing.**
+
+     Ollie, 2026-10-24: *"yellow enemies turn red when aggrod by you... add grey
+     out if tapped by other player and yellow turn red when angry on nameplates
+     too not just unitframes"*.
+
+     The unit frames have always done both -- they have a unit token, so they
+     ask `UnitReaction` and `UnitIsTapped`. A nameplate on a stock client has
+     no token and everything it knows is the colour the client painted the
+     health bar, which is the mob's **faction standing**, not its mood: a
+     neutral mob that has decided to kill you is still a yellow bar.
+
+     SuperWoW gives a plate its unit's GUID, which is a unit token, and since
+     v0.99.353 `ExactUnit` hands it over. So the two questions the colour cannot
+     answer are now asked of the client. ]==]
+context = "plate reaction: "
+
+SUPERWOW_VERSION = "1.4"
+OB.RecheckCapabilities()
+
+GLOBAL_boarP = Stub.NewNamePlate("Snow Leopard", 10, 1, 1, 0, 60)
+plates:Scan()
+
+GLOBAL_plateP = plates.plates[GLOBAL_boarP]
+check(GLOBAL_plateP ~= nil, "a yellow plate is adopted")
+
+GLOBAL_boarP.superwowGuid = "0xPLATEN"
+Stub.plateUnits = { ["0xPLATEN"] = { name = "Snow Leopard" } }
+
+--[[ Neutral by faction, and the bar is painted yellow to say so. ]]--
+Stub.reactions["0xPLATEN"] = 4
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "NEUTRAL_NPC",
+        "a neutral mob reads neutral",
+        tostring(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN")))
+
+--[==[ **And then it swings at you.** The bar does not change -- its faction has
+     not -- but `UnitReaction` drops, which is the whole of what the unit frames
+     have been reading all along. ]==]
+Stub.reactions["0xPLATEN"] = 2
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "ENEMY_NPC",
+        "and one that has turned on you reads hostile",
+        tostring(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN")))
+
+--[[ Driven through `Refresh`, which is what paints it: the client's bar is
+     still yellow and the plate comes out in the enemy colour. ]]--
+plates:ResetPlateIdentity(GLOBAL_plateP)
+plates:Refresh(GLOBAL_plateP)
+
+eq(GLOBAL_plateP.kind, "ENEMY_NPC",
+        "so the plate is drawn as an enemy while its bar is still yellow",
+        tostring(GLOBAL_plateP.kind))
+
+--[[ The **green** channel, not the red: neutral and enemy are both full red
+     here, so a test on that one passes either way and proves nothing. Green is
+     where they differ -- a yellow bar has all of it and a red bar none. ]]--
+near(GLOBAL_plateP.health.barColor[2], cfg.enemyColor[2], 0.001,
+        "in the enemy colour rather than the neutral one",
+        tostring(GLOBAL_plateP.health.barColor[2]))
+
+--[==[ **And the same on a plate: neutral until it swings at you.**
+
+     The first version of this read the reaction and stopped there, which is why
+     Ollie saw no change at all -- the reaction never moves. A plate asks the
+     same question the threat colouring does, through the same token. ]==]
+Stub.reactions["0xPLATEN"] = 4
+Stub.plateUnits["0xPLATEN"].target = nil
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "NEUTRAL_NPC",
+        "a neutral mob attacking nothing is neutral")
+
+Stub.plateUnits["0xPLATEN"].target = "player"
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "ENEMY_NPC",
+        "and one attacking you is an enemy",
+        tostring(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN")))
+
+--[[ Driven through `Refresh`: the client's bar is still yellow and the plate
+     comes out red. ]]--
+plates:ResetPlateIdentity(GLOBAL_plateP)
+plates:Refresh(GLOBAL_plateP)
+
+eq(GLOBAL_plateP.kind, "ENEMY_NPC",
+        "so the plate is drawn as an enemy while its bar is still yellow",
+        tostring(GLOBAL_plateP.kind))
+
+near(GLOBAL_plateP.health.barColor[2], cfg.enemyColor[2], 0.001,
+        "in the enemy colour rather than the neutral one",
+        tostring(GLOBAL_plateP.health.barColor[2]))
+
+Stub.plateUnits["0xPLATEN"].target = nil
+
+--[==[ **Tapped by somebody else is grey, and it beats everything.**
+
+     The client greys the bar too, which is why `PlateKind` has a band for it --
+     but the band is a guess at a colour and this is the fact. Asked first, in
+     the same order the client's own `TargetFrame_CheckFaction` asks it: a mob
+     another player tagged gives you nothing, and what it would otherwise have
+     been coloured does not matter. ]==]
+Stub.tapped["0xPLATEN"] = { tapped = true, byPlayer = false }
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "TAPPED",
+        "a mob somebody else tagged reads tapped",
+        tostring(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN")))
+
+plates:ResetPlateIdentity(GLOBAL_plateP)
+plates:Refresh(GLOBAL_plateP)
+
+eq(GLOBAL_plateP.kind, "TAPPED", "and the plate goes grey",
+        tostring(GLOBAL_plateP.kind))
+
+near(GLOBAL_plateP.health.barColor[1], OB.PLATE_TAPPED_COLOR[1], 0.001,
+        "in the client's own grey")
+
+--[[ Tagged by you is not tapped at all: it is yours, and it reads as whatever
+     it actually is. ]]--
+Stub.tapped["0xPLATEN"] = { tapped = true, byPlayer = true }
+Stub.reactions["0xPLATEN"] = 2
+
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), "ENEMY_NPC",
+        "a mob you tagged yourself is not greyed -- it reads as what it is",
+        tostring(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN")))
+
+--[==[ **Without a token there is no opinion**, and the bar keeps the floor.
+     That is every stock 1.12 client, where this cannot be done at all and the
+     colour is the only thing there is. ]==]
+eq(plates:KindFromUnit(GLOBAL_plateP, nil), nil,
+        "no unit, no answer")
+
+--[[ Nor for a player: their plate is decided by colour and by what has been
+     verified about the name, which is a careful piece of logic about not
+     trusting a red bar, and a reaction has nothing to add to it. ]]--
+Stub.plateUnits["0xPLATEN"].isPlayer = true
+eq(plates:KindFromUnit(GLOBAL_plateP, "0xPLATEN"), nil,
+        "and a player's plate is left to the logic that handles players")
+
+Stub.tapped["0xPLATEN"] = nil
+Stub.reactions["0xPLATEN"] = nil
+Stub.plateUnits = nil
+GLOBAL_boarP.superwowGuid = nil
+GLOBAL_boarP:Hide()
+SUPERWOW_VERSION = nil
+OB.RecheckCapabilities()
+
+context = "plate border weight: "
+
+-- ---------------------------------------------------------------------------
+-- and a debuff belongs to one mob, not to every mob with that name
+-- ---------------------------------------------------------------------------
+
+--[==[ **Two Mountain Boars, one Rend.**
+
+     Ollie, 2026-10-02, with a screenshot of a boar wearing a Rend cast on a
+     *different* boar: *"Rend should only appear on the exact mob that I cast
+     Rend on"*.
+
+     `M:ExactUnit` answered `"target"` or `"mouseover"` and otherwise nothing, so
+     a plate that was neither had no unit at all and fell back to matching the
+     name written on it. `M:PlateUnit` has resolved this plate's **GUID** through
+     SuperWoW for a while -- the cast bars were moved onto it for exactly this
+     reason -- and the debuff path never asked.
+
+     Driven through `Refresh`, which is what draws the icons. ]==]
+SUPERWOW_VERSION = "1.4"
+OB.RecheckCapabilities()
+
+GLOBAL_boarA = Stub.NewNamePlate("Mountain Boar", 10, 1, 0, 0, 60)
+GLOBAL_boarB = Stub.NewNamePlate("Mountain Boar", 10, 1, 0, 0, 60)
+plates:Scan()
+
+GLOBAL_plateA = plates.plates[GLOBAL_boarA]
+GLOBAL_plateB = plates.plates[GLOBAL_boarB]
+
+check(GLOBAL_plateA ~= nil and GLOBAL_plateB ~= nil,
+        "two plates with the same name are both adopted")
+
+GLOBAL_boarA.superwowGuid = "0xPLATEA"
+GLOBAL_boarB.superwowGuid = "0xPLATEB"
+
+Stub.plateUnits = {
+    ["0xPLATEA"] = { name = "Mountain Boar" },
+    ["0xPLATEB"] = { name = "Mountain Boar" },
+}
+
+eq(plates:ExactUnit(GLOBAL_plateA, "Mountain Boar"), "0xPLATEA",
+        "a plate that is neither target nor mouseover still has a unit",
+        tostring(plates:ExactUnit(GLOBAL_plateA, "Mountain Boar")))
+
+--[[ The bleed is on one of them, and the client says so when asked about that
+     one. The store is keyed by name, because the combat log is, and that is the
+     whole source of the confusion this is about. ]]--
+Stub.debuffs["0xPLATEA"] = {
+    { texture = "Interface\\Icons\\Ability_Gouge", count = 0 },
+}
+Stub.debuffs["0xPLATEB"] = nil
+
+Stub.SetClock(32000)
+OB.auras = {}
+OB.AddAura("Mountain Boar", "Rend", "Interface\\Icons\\Ability_Gouge")
+
+cfg.debuffs = true
+cfg.guessDebuffs = true
+
+plates:ResetPlateIdentity(GLOBAL_plateA)
+plates:ResetPlateIdentity(GLOBAL_plateB)
+plates:Refresh(GLOBAL_plateA)
+plates:Refresh(GLOBAL_plateB)
+
+check(GLOBAL_plateA.debuffs[1]:IsShown(), "the boar you Rended wears it")
+check(not GLOBAL_plateB.debuffs[1]:IsShown(), "and the other boar does not")
+
+--[==[ **And the reported case: the Rended one is gone and only the other is on
+     screen.**
+
+     This is the screenshot. With one plate of that name visible the ambiguity
+     guard lets the name-keyed guess through, and the guess knows only that
+     *something* called Mountain Boar is bleeding. Asked about its own unit, this
+     plate says it is not. ]==]
+plates.visibleNameCounts = { ["Mountain Boar"] = 1 }
+plates:ResetPlateIdentity(GLOBAL_plateB)
+plates:Refresh(GLOBAL_plateB)
+
+check(not GLOBAL_plateB.debuffs[1]:IsShown(),
+        "a boar alone on screen does not inherit the dead one's Rend")
+
+--[==[ **The exact scan is authoritative even when it finds nothing**, which is
+     the half that makes the line above work: a plate with a unit token never
+     falls through to the guess, so an empty answer is an answer. ]==]
+eq(table.getn(plates:DebuffSource(GLOBAL_plateB, "0xPLATEB", "Mountain Boar", 10)), 0,
+        "its own debuff list is empty rather than borrowed")
+
+--[==[ **Without the client mod there is no token, and the name is all there
+     is.**
+
+     Said out loud rather than left implied: on a stock 1.12 client two mobs with
+     one name cannot be told apart by anything the API exposes, and the module's
+     answer there is to refuse to guess while two plates share a name rather than
+     to paint both. ]==]
+SUPERWOW_VERSION = nil
+OB.RecheckCapabilities()
+
+eq(plates:ExactUnit(GLOBAL_plateA, "Mountain Boar"), nil,
+        "with no client mod a plate has no unit of its own")
+
+plates.visibleNameCounts = { ["Mountain Boar"] = 2 }
+plates:ResetPlateIdentity(GLOBAL_plateB)
+plates:Refresh(GLOBAL_plateB)
+
+check(not GLOBAL_plateB.debuffs[1]:IsShown(),
+        "and two plates sharing a name are left blank rather than both painted")
+
+SUPERWOW_VERSION = "1.4"
+OB.RecheckCapabilities()
+Stub.debuffs["0xPLATEA"] = nil
+Stub.plateUnits = nil
+GLOBAL_boarA.superwowGuid = nil
+GLOBAL_boarB.superwowGuid = nil
+SUPERWOW_VERSION = nil
+OB.RecheckCapabilities()
+
+GLOBAL_boarA:Hide()
+GLOBAL_boarB:Hide()
+plates.visibleNameCounts = nil
+OB.auras = {}
+
+-- ---------------------------------------------------------------------------
+-- and a dead unit takes its debuffs with it
+-- ---------------------------------------------------------------------------
+
+--[==[ **Debuffs moved to the next mob of the same name.**
+
+     Ollie, 2026-10-01, with a screenshot of a Snow Leopard wearing two debuffs
+     it never had: *"debuffs transfer to targets of the same name when the
+     original dies, it gets fixed on hover"*.
+
+     The store is keyed by **name**, and it has to be -- the combat log is the
+     only source for a debuff on anything that is not your target, and it names
+     units. So the leopard you killed and the leopard beside it are one key, and
+     killing the first left its Rend under the second's name for the thirty
+     seconds the staleness sweep allows.
+
+     Hover fixed it because a hover is a *unit token*, and an exact scan off a
+     token overrules the guess. Away from one there was nothing to correct it
+     with, so the only honest moment to drop it is the death itself -- and
+     nothing in this addon was reading a death at all except the cast bar. ]==]
+eq(Stub.EventListeners("CHAT_MSG_COMBAT_HOSTILE_DEATH") > 0, true,
+        "something is listening for a death")
+
+--[[ Every sentence the client has for it, and **which name died**. The two-name
+     ones name the dead first and the killer second; reading the second forgets
+     the killer, who is usually the player and very much alive. ]]--
+eq(OB.ReadDeathLine("Snow Leopard dies."), "Snow Leopard", "a mob dies")
+eq(OB.ReadDeathLine("You have slain Snow Leopard!"), "Snow Leopard",
+        "or you kill it yourself, which is how most things die")
+eq(OB.ReadDeathLine("Snow Leopard is slain by Sylvie!"), "Snow Leopard",
+        "or somebody else does -- and the dead one is named first")
+eq(OB.ReadDeathLine("Snow Leopard is killed by Sylvie."), "Snow Leopard",
+        "or something kills it outright")
+eq(OB.ReadDeathLine("Totem of Wrath is destroyed."), "Totem of Wrath",
+        "and a thing that is destroyed rather than killed")
+eq(OB.ReadDeathLine("Snow Leopard hits you for 40."), nil,
+        "a line that is not a death is not one")
+
+--[==[ **Driven through the plate**, not through the store, because the store
+     was never the broken part -- the absence of anything watching for a death
+     was, and a test that called the forget by hand would say nothing about
+     that. ]==]
+Stub.SetClock(30100)
+OB.auras = {}
+OB.AddAura("Gordok Enforcer", "Rend", "Interface\\Icons\\Ability_Gouge")
+
+plates.visibleNameCounts = nil
+plates:ResetPlateIdentity(adoptedEnemy)
+plates:Refresh(adoptedEnemy)
+
+check(adoptedEnemy.debuffs[1]:IsShown(), "a plate guesses the debuff by name")
+
+Stub.FireEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH", "You have slain Gordok Enforcer!")
+
+eq(OB.auras["Gordok Enforcer"], nil, "killing it forgets what was on it")
+
+--[[ A quarter second later, because the guessed list is cached for that long --
+     the throttle that stops `OB.AuraList` being rebuilt for every plate on every
+     frame. That bound is what the icon's lifetime after a death now is. ]]--
+Stub.SetClock(30101)
+plates:Refresh(adoptedEnemy)
+
+check(not adoptedEnemy.debuffs[1]:IsShown(),
+        "and the next mob of that name does not inherit it")
+
+--[==[ **The survivor loses its icons too, and that is the right way round.**
+
+     A name-keyed store cannot tell two leopards apart, so forgetting one
+     forgets both. A false icon says "it is already bleeding" and costs a Rend
+     that never lands; a missing one costs a wasted global and comes back on the
+     next tick of a bleed that is really there. ]==]
+OB.AddAura("Gordok Enforcer", "Rend", "Interface\\Icons\\Ability_Gouge")
+Stub.FireEvent("CHAT_MSG_COMBAT_FRIENDLY_DEATH", "Gordok Enforcer dies.")
+
+eq(OB.auras["Gordok Enforcer"], nil, "a friendly death is read the same way")
+
+--[[ And nothing is forgotten for a line that names nobody. ]]--
+OB.AddAura("Gordok Enforcer", "Rend", "Interface\\Icons\\Ability_Gouge")
+Stub.FireEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH", "Gordok Enforcer hits you for 40.")
+
+check(OB.auras["Gordok Enforcer"] ~= nil,
+        "a line that is not a death forgets nothing")
+
+OB.auras = {}
+plates:ResetPlateIdentity(adoptedEnemy)
+
 cfg.guessDebuffs = true
 Stub.mouseover = nil
 adoptedEnemy.original.glow:Hide()
@@ -29686,11 +32867,119 @@ eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "16s",
         "a second sighting does not restart the clock",
         tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
 
---[[ And a log line still does start it, because that one really is the moment
-     it landed. ]]--
+--[==[ **A log line is an application, and it restarts the clock.**
+
+     Ollie, 2026-10-02: *"if Rend is reapplied before it expires, the actual Rend
+     duration is refreshed in-game but the addon timer is not"* -- and then the
+     number disappears while the bleed is plainly still on.
+
+     This block used to assert the opposite, that a line arriving here is a
+     **tick**: the module listens to `CHAT_MSG_SPELL_PERIODIC_*_DAMAGE`, a bleed
+     sends one every three seconds, and treating each as an application pinned a
+     nine second Rend at nine seconds for ever.
+
+     The channel was right and the conclusion was wrong. Both sentences arrive on
+     those channels and the module parses exactly one of them -- "%s is afflicted
+     by %s." A tick reads "%s suffers %d %s damage from your %s." and cannot
+     match it, so **no tick has ever reached `AddAura`**, and what the guard
+     suppressed was the refresh.
+
+     **Driven through the event rather than by calling `AddAura`**, which is the
+     whole reason the belief survived a release: `ReadAuraLine` begins `if not
+     AURAADDEDOTHERHARMFUL then return nil end`, that global was absent here, and
+     so the entire combat-log path was dead code while every test called the
+     store by hand. Both shapes of line go in below. ]==]
+GLOBAL_auras = OB.auraWatch
+
+OB.auras = {}
+OB.auraSeen = {}
+OB.auraLengths = {}
+
+Stub.SetClock(41100)
+Stub.FireEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE",
+        "Gordok Enforcer is afflicted by Rend.")
+
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "21s",
+        "an application line starts the clock",
+        tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
+
+--[[ A tick of that same bleed, on the same channel. It is not an application and
+     it does not reach the store at all. ]]--
+Stub.SetClock(41105)
+Stub.FireEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE",
+        "Gordok Enforcer suffers 20 Physical damage from your Rend.")
+
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "16s",
+        "a tick line does not touch it",
+        tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
+
+eq(GLOBAL_auras:ReadAuraLine(
+        "Gordok Enforcer suffers 20 Physical damage from your Rend."), nil,
+        "because the reader does not match one")
+
+--[==[ **Reapplied with time still on it, which is the reported bug.** ]==]
+Stub.SetClock(41112)
+Stub.FireEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE",
+        "Gordok Enforcer is afflicted by Rend.")
+
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "21s",
+        "reapplying it before it expires restarts the countdown",
+        tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
+
+--[==[ **And a scan still does not**, which is the thing the old guard was for
+     and the reason it cannot simply be deleted. `ScanExactDebuffs` runs four
+     times a second per plate; stamping on each pass is a timer that never
+     counts down, reported twice. ]==]
+Stub.SetClock(41117)
+OB.NoteAura("Gordok Enforcer", "Rend")
+
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "16s",
+        "a scan five seconds later leaves it alone",
+        tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
+
+--[==[ **Unless the scan can see it after our clock says it is gone.**
+
+     Nothing in 1.12 announces a refresh distinguishably, and nothing announces
+     one at all for a debuff somebody else applied -- so an aura still visibly
+     on the unit after its own length has run out is the only evidence there is
+     that it was put back on. Acting on it is the difference between a late
+     number and no number, and no number is what was reported.
+
+     Generic: any debuff with a known duration, ticking or not. ]==]
+Stub.SetClock(41140)
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), nil,
+        "by its own clock it has run out")
+
+OB.NoteAura("Gordok Enforcer", "Rend")
+
+eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "21s",
+        "but seeing it there says otherwise, and the countdown comes back",
+        tostring(OB.AuraTimeText("Gordok Enforcer", "Rend")))
+
+--[==[ **And it can be watched happening.**
+
+     `/eq auradebug`. Off by default and silent when off, because these calls sit
+     on the combat-log path -- the hottest thing in the addon during a fight. ]==]
+eq(OB.auraDebug, false, "the aura log ships off")
+eq(OB.AuraDebug("applied", "Gordok Enforcer", "Rend"), false,
+        "and says nothing while it is")
+
+SlashCmdList["EQUADISOMNIBARS"]("auradebug")
+eq(OB.auraDebug, true, "the command turns it on")
+
+eq(OB.AuraDebug("applied", "Gordok Enforcer", "Rend"), true,
+        "and then an application is reported")
+
+SlashCmdList["EQUADISOMNIBARS"]("auradebug")
+eq(OB.auraDebug, false, "and typing it again turns it off")
+
+--[[ And a genuinely new aura still starts its clock on the first line. ]]--
+OB.auras = {}
+OB.auraSeen = {}
+Stub.SetClock(42000)
 OB.AddAura("Gordok Enforcer", "Rend")
 eq(OB.AuraTimeText("Gordok Enforcer", "Rend"), "21s",
-        "while a fresh application does")
+        "a first sighting starts it")
 
 --[==[ **And the scanner itself, which is the one that was still re-stamping.**
 
@@ -29951,6 +33240,102 @@ eq(frames:ApplyAuraTimers("target"), 0,
 --[[ Asked of the table directly as well, so a failure says whether the lookup
      or the drawing is at fault. ]]--
 check(OB.buffDurations ~= nil, "there is a buff duration table")
+
+--[==[ **A ranked spell counts down at the rank this character casts.**
+
+     Ollie, 2026-09-29: *"rend still starting at 20. idk if its just a rend
+     issue"*. It was not just Rend -- it was every spell whose duration changes
+     with its rank.
+
+     `debuffDurations` carries them per rank:
+
+         ['Rend'] = { [1]=9, [2]=12, [3]=15, [4]=18, [5]=21, [6]=21, [7]=21,
+                      [0]=21 }
+
+     and the reader asked for `ranks[0]` and nothing else. Rank zero is the
+     entry for "rank unknown" and is deliberately the **longest**, because
+     guessing short shows a timer expiring while the debuff is visibly still on.
+     So a warrior whose Rend is rank 1 was shown twenty-one seconds for a nine
+     second bleed -- which reads as 20 the instant it ticks, which is what was
+     reported. ]==]
+OB.auras = {}
+OB.auraLengths = {}
+OB.spellRanks = {}
+
+--[[ The rank is read from the spellbook, which is the only place it is
+     knowable: a combat log line carries the spell's name and never its rank. ]]--
+Stub.player.spellNames = { { "Rend", "Rank 1" } }
+
+eq(OB.PlayerSpellRank("Rend"), 1, "the rank this character knows is read")
+
+Stub.SetClock(60000)
+OB.AddAura("Gordok Enforcer", "Rend")
+
+GLOBAL_rendLeft = OB.AuraTimeLeft("Gordok Enforcer", "Rend")
+eq(GLOBAL_rendLeft, 9, "a rank 1 Rend counts down from nine",
+        tostring(GLOBAL_rendLeft))
+
+--[==[ **And the highest rank known is the one used**, because people cast their
+     best rank and a lower one is a deliberate act the combat log gives no way
+     to see. A spellbook holding several is not ambiguous. ]==]
+OB.auras = {}
+OB.auraLengths = {}
+OB.spellRanks = {}
+Stub.player.spellNames = { { "Rend", "Rank 1" }, { "Rend", "Rank 5" } }
+
+eq(OB.PlayerSpellRank("Rend"), 5, "the highest rank wins")
+
+OB.AddAura("Gordok Enforcer", "Rend")
+eq(OB.AuraTimeLeft("Gordok Enforcer", "Rend"), 21,
+        "and a rank 5 Rend counts down from twenty-one")
+
+--[==[ **A spell this character does not have still takes the long answer.**
+
+     A mob's Rend on the player is cast at a rank nothing here can see, and
+     guessing short would show the timer expiring while the bleed is still
+     ticking. That was the reason for `ranks[0]` and it is still the reason. ]==]
+OB.auras = {}
+OB.auraLengths = {}
+OB.spellRanks = {}
+Stub.player.spellNames = {}
+
+eq(OB.PlayerSpellRank("Rend"), nil, "a spell the character lacks has no rank")
+
+OB.AddAura("Gordok Enforcer", "Rend")
+eq(OB.AuraTimeLeft("Gordok Enforcer", "Rend"), 21,
+        "so it falls back to the longest, as before")
+
+--[==[ **Nothing is written down when it would change nothing.** A spell whose
+     table has one entry for every rank, or none at all, is left to the existing
+     lookup -- a recorded length that merely repeats it is a second copy to go
+     wrong later. ]==]
+Stub.player.spellNames = { { "Expose Armor", "Rank 1" } }
+OB.spellRanks = {}
+eq(OB.RankedDuration("Expose Armor"), nil,
+        "a spell with one duration for every rank records nothing")
+
+Stub.player.spellNames = { { "Not A Real Spell", "Rank 2" } }
+OB.spellRanks = {}
+eq(OB.RankedDuration("Not A Real Spell"), nil,
+        "and neither does one with no table at all")
+
+--[==[ **Training a rank changes the answer**, and the cache has to go with it
+     or a freshly trained rank counts down at the old one's length for the rest
+     of the session. ]==]
+Stub.player.spellNames = { { "Rend", "Rank 1" } }
+OB.spellRanks = {}
+eq(OB.PlayerSpellRank("Rend"), 1, "rank 1 to begin with")
+
+Stub.player.spellNames = { { "Rend", "Rank 2" } }
+eq(OB.PlayerSpellRank("Rend"), 1, "the answer is remembered rather than re-read")
+
+Stub.FireEvent("SPELLS_CHANGED")
+eq(OB.PlayerSpellRank("Rend"), 2, "and learning one drops what was remembered")
+
+OB.auras = {}
+OB.auraLengths = {}
+OB.spellRanks = {}
+Stub.player.spellNames = {}
 eq(OB.buffDurations["Power Word: Fortitude"][0], 1800,
         "with the buffs a target actually carries in it")
 eq(OB.buffDurations["Greater Blessing of Might"][0], 900,
@@ -30131,6 +33516,46 @@ eq(frames:ReactionColor("target")[1], cfg.hostileColor[1], "below it is hostile"
 
 Stub.reaction = 6
 eq(frames:ReactionColor("target")[1], cfg.friendlyColor[1], "above it is friendly")
+
+--[==[ **Neutral until it swings at you.**
+
+     Ollie, twice: *"yellow enemies turn red when aggrod by you. both nameplate
+     and unitframe"* -- and after the first attempt, *"this didnt change"*.
+
+     The first attempt read `UnitReaction` harder, which could never have
+     worked: a reaction is a **faction standing** and aggro does not move it. A
+     boar you have just pulled is still 4, still yellow, and the client's own
+     `TargetFrame_CheckFaction` paints it straight out of
+     `UnitReactionColor[4]` for the whole fight.
+
+     Who it is attacking is the part that changes. `targettarget` is how every
+     1.12 client answers that, and it is the same question the nameplate threat
+     colouring has asked since it was written. ]==]
+Stub.reaction = 4
+Stub.player.targetsTarget = nil
+
+eq(frames:ReactionColor("target")[1], cfg.neutralColor[1],
+        "a neutral mob minding its own business stays yellow")
+
+Stub.player.targetsTarget = "player"
+
+eq(frames:ReactionColor("target")[1], cfg.hostileColor[1],
+        "and turns red the moment it is swinging at you",
+        tostring(frames:ReactionColor("target")[1]))
+
+--[[ It is the *neutral* band this applies to. Something already hostile was
+     red before it noticed you and stays red, and a friendly healing you is not
+     turned red by having you targeted. ]]--
+Stub.reaction = 6
+eq(frames:ReactionColor("target")[1], cfg.friendlyColor[1],
+        "a friendly targeting you is still friendly")
+
+Stub.reaction = 2
+eq(frames:ReactionColor("target")[1], cfg.hostileColor[1],
+        "and a hostile one was red already")
+
+Stub.player.targetsTarget = nil
+Stub.reaction = 4
 
 -- ---------------------------------------------------------------------------
 -- what the bars say
@@ -31247,6 +34672,84 @@ eq(OB.SpellIcon("Corruption"), "Interface\\Icons\\Spell_Shadow_Corruption",
 --[==[ **No icon rather than a wrong one.** A spell in neither place simply has
      none, and a bar without an icon reads fine -- a bar wearing somebody else's
      icon is a spell you would swear you recognised. ]==]
+--[==[ **Items are scanned too, because plenty of what you cast is not a spell.**
+
+     Ollie, 2026-09-30, with a screenshot of an eight second cast bar wearing a
+     question mark: *"its using the ? icon even though we know the item"*. It was
+     a Portable Wormhole Generator -- and the scan read the **spellbook**, which
+     no item is in. Every trinket, every engineering gadget, every bandage came
+     up bare for the same reason.
+
+     The client hands the cast bar a *name* and nothing else, so the map has to
+     be by name; the two places a usable item actually is are your bags and your
+     own body, and both carry the texture already. ]==]
+Stub.bags[0] = Stub.bags[0] or {}
+Stub.bags[0][1] = {
+    name = "Portable Wormhole Generator",
+    link = "|cff1eff00|Hitem:30542:0:0:0|h[Portable Wormhole Generator]|h|r",
+    texture = "Interface\\Icons\\INV_Misc_EnggiZportal",
+    count = 1,
+}
+
+OB.ForgetSpellIcons()
+
+eq(OB.SpellIcon("Portable Wormhole Generator"),
+        "Interface\\Icons\\INV_Misc_EnggiZportal",
+        "an item in your bags answers with its own icon",
+        tostring(OB.SpellIcon("Portable Wormhole Generator")))
+
+--[[ And the name comes out of the link, which is the only shape that is the
+     same on every client and in every locale. ]]--
+eq(OB.ItemNameFromLink(
+        "|cff1eff00|Hitem:30542:0:0:0|h[Portable Wormhole Generator]|h|r"),
+        "Portable Wormhole Generator", "the name is read out of a link")
+eq(OB.ItemNameFromLink(nil), nil, "and nothing out of nothing")
+eq(OB.ItemNameFromLink("not a link"), nil, "or out of something that is not one")
+
+--[==[ **A trinket is the on-use item people reach for most**, and it is in
+     neither the spellbook nor a bag. ]==]
+Stub.equipped[13] = { 12930, "Trinket" }
+Stub.items[12930] = {
+    name = "Briarwood Reed",
+    itemType = "Trinket",
+    equipLoc = "INVTYPE_TRINKET",
+}
+Stub.equipped[13] = { 12930, "Trinket", "Interface\\Icons\\INV_Misc_Branch_01" }
+
+OB.ForgetSpellIcons()
+
+eq(OB.SpellIcon("Briarwood Reed"), "Interface\\Icons\\INV_Misc_Branch_01",
+        "and a trinket you are wearing answers with its own",
+        tostring(OB.SpellIcon("Briarwood Reed")))
+
+--[==[ **What you carry changing drops the map**, or an item bought or equipped
+     five minutes ago still has no icon. Dropped rather than rebuilt on the
+     event: `BAG_UPDATE` arrives on every loot, every sale and every stack merge,
+     and the next cast is what pays for it. ]==]
+Stub.bags[0][2] = {
+    name = "Major Healing Potion",
+    link = "|cffffffff|Hitem:13446:0:0:0|h[Major Healing Potion]|h|r",
+    texture = "Interface\\Icons\\INV_Potion_54",
+    count = 5,
+}
+
+eq(OB.SpellIcon("Major Healing Potion"), UNKNOWN_SPELL_ICON,
+        "a map built before it arrived does not know about it",
+        tostring(OB.SpellIcon("Major Healing Potion")))
+
+Stub.FireEvent("BAG_UPDATE")
+
+eq(OB.SpellIcon("Major Healing Potion"), "Interface\\Icons\\INV_Potion_54",
+        "and the next lookup after a bag change does",
+        tostring(OB.SpellIcon("Major Healing Potion")))
+
+--[==[ **The shipped item list is the last resort**, for something the client has
+     cached but the player is no longer holding. It is built on the first miss
+     rather than at login: reversing twenty-two thousand names costs a table most
+     sessions never need. ]==]
+eq(OB.ItemIconByName("Nothing Is Called This"), nil,
+        "a name in no list answers nothing")
+
 eq(OB.SpellIcon("Something Nobody Has"), UNKNOWN_SPELL_ICON, "and anything else gets the question mark")
 eq(OB.SpellIcon(nil), nil, "nor does nothing at all")
 
@@ -31577,6 +35080,65 @@ cfg.feignHealth = false
 eq(frames:HealthOf("target"), Stub.player.health,
         "and the client's answer is used with it switched off")
 cfg.feignHealth = true
+
+--[==[ **The scanning tooltip must not end up on screen.**
+
+     Ollie, 2026-09-24: *"Feel/fight to death tooltip appearing strangely?"*
+
+     Reading a feigning hunter's real health means pointing a tooltip at them
+     and reading its status bar. **Every `Set*` on a 1.12 tooltip shows it** --
+     "fill this in and put it on screen" is one action, not two -- so a scanner
+     that is never hidden again is a tooltip sitting on the player's screen,
+     anchored nowhere in particular, appearing whenever somebody feigns.
+
+     This had never run in the suite at all: the scrape begins `if not
+     tip.SetUnit then return nil end` and the harness had no `SetUnit`, so every
+     call returned nil on its first line and the function was dead code. ]==]
+Stub.player.dead = true
+Stub.player.health = 1800
+
+GLOBAL_feignRead = frames:FeignActualHealth("target")
+GLOBAL_feignTip = getglobal("EquadisUnitFrameFeignScanner")
+
+check(GLOBAL_feignTip ~= nil, "the scrape builds a scanning tooltip")
+check(not GLOBAL_feignTip:IsShown(),
+        "and does not leave it on screen")
+
+--[[ It has to have actually read something, or "not shown" is passing because
+     nothing happened. ]]--
+eq(GLOBAL_feignRead, 1800, "having read the health off its status bar",
+        tostring(GLOBAL_feignRead))
+
+--[[ Owned away from the cursor every time rather than once at build, so it
+     cannot inherit an anchor from whatever was hovered last. ]]--
+GLOBAL_feignOwner, GLOBAL_feignAnchor = GLOBAL_feignTip:GetOwner()
+eq(GLOBAL_feignAnchor, "ANCHOR_NONE",
+        "anchored nowhere", tostring(GLOBAL_feignAnchor))
+
+--[==[ **And the player's own tooltip is left alone.** The scanner is a separate
+     frame precisely so that scraping never disturbs what is being hovered; if
+     the scrape ever reached `GameTooltip`, a feigning hunter in the party would
+     rewrite whatever the player was reading. ]==]
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetText("Something The Player Is Reading")
+GLOBAL_feignLines = GameTooltip:NumLines()
+
+frames:FeignActualHealth("target")
+
+eq(GameTooltip:NumLines(), GLOBAL_feignLines,
+        "scraping does not touch the tooltip the player is reading")
+eq(getglobal("GameTooltipTextLeft1"):GetText(),
+        "Something The Player Is Reading", "nor what it says")
+
+--[[ Repeated scrapes stay put away -- once hidden is not the same as staying
+     hidden, and this runs on every health update while somebody feigns. ]]--
+frames:FeignActualHealth("target")
+frames:FeignActualHealth("target")
+check(not GLOBAL_feignTip:IsShown(),
+        "and it stays put away across repeated reads")
+
+Stub.player.health = 3200
 
 Stub.player.dead = false
 
@@ -32165,7 +35727,12 @@ frames:NotePVPFlags()
 
 check(frames:PVPGraceStart() == nil, "flagging up starts no countdown")
 
---[[ Now the toggle: the flag changes and you are still flagged. ]]--
+--[==[ **Now the toggle**, which is two things and not one: `/pvp` goes through
+     `TogglePVP`, and the flag change follows it while you are still flagged.
+     The flag change on its own is the same event whether PvP went off or on,
+     which is the whole of the bug fixed in v0.99.324. ]==]
+frames:NotePVPToggle()
+eq(frames:PVPDesired(), false, "the toggle says the flag is on its way out")
 frames:NotePVPFlags()
 
 check(frames:PVPGraceStart() ~= nil, "toggling it off starts the five minutes")
@@ -32236,6 +35803,97 @@ check(OB.profile.pvpGraceAt == nil,
 
 check(EquadisClassicOverhaulDB.pvpGrace ~= nil,
         "it lives with the other facts this addon keeps")
+
+--[==[ **Flagged is not the same fact as "about to unflag", and only the
+     second one deserves a number.**
+
+     `PLAYER_FLAGS_CHANGED` fires for the player, leaves you flagged and leaves
+     AFK and DND alone **whichever way `/pvp` went**. Reading that as "switched
+     off" meant switching PvP *on* while already flagged started a five-minute
+     countdown for a flag that is never going to drop -- and a permanent flag on
+     a PvP realm or in a battleground read the same way. Reported as "should
+     only show if pvp is actually scheduled to turn off".
+
+     What decides it is the desired flag, and `TogglePVP` is the one call that
+     changes it. ]==]
+Stub.clockOffset = 0
+frames:ClearPVPGrace()
+Stub.pvp.flagged = true
+frames.pvpDesired = nil
+frames.pvpWasFlagged = true
+frames.pvpWasAfk = false
+frames.pvpWasDnd = false
+
+--[[ Nobody has said which way it is. That is not a countdown. ]]--
+eq(frames:PVPDesired(), nil, "before anything says so, the desired flag is unknown")
+frames:NotePVPFlags()
+check(frames:PVPGraceStart() == nil,
+        "and an unknown desired flag starts no countdown")
+
+--[==[ **Turned on while already flagged**: the same event, the opposite
+     meaning. This is the one that was drawing five minutes at nothing. ]==]
+frames.pvpDesired = false
+frames:NotePVPToggle()
+eq(frames:PVPDesired(), true, "toggling on is a flag that is staying")
+frames:NotePVPFlags()
+check(frames:PVPGraceStart() == nil, "switching PvP on starts no countdown")
+
+frames:UpdatePVPTimer(true)
+check(not frames.pvpTimerText:IsShown(), "and nothing is drawn for a permanent flag")
+
+--[==[ **A grace already running goes the moment PvP is switched back on**,
+     rather than counting down to a flag that will still be there. ]==]
+frames.pvpDesired = false
+frames:StartPVPGrace()
+frames:UpdatePVPTimer(true)
+check(frames.pvpTimerText:IsShown(), "a real countdown is drawn")
+
+frames:NotePVPToggle()
+eq(frames:PVPDesired(), true, "switching it back on")
+check(frames:PVPGraceStart() == nil, "drops the countdown at once")
+frames:UpdatePVPTimer(true)
+check(not frames.pvpTimerText:IsShown(), "and takes the number off the screen")
+
+--[==[ **`GetPVPDesired` wins when the build has it**, the same way
+     `GetPVPTimer` does: a client that exports the answer is not worth
+     second-guessing. Vanilla's own FrameXML never calls it -- `/pvp` is
+     `TogglePVP()` and nothing else -- so whether this build has it is a
+     question only `/eq pvpdebug` on that client can settle. ]==]
+frames.pvpDesired = true
+GLOBAL_realDesired = GetPVPDesired
+GetPVPDesired = function() return nil end
+GLOBAL_pvpDesired, GLOBAL_pvpSource = frames:PVPDesired()
+eq(GLOBAL_pvpDesired, false, "the client's answer is taken")
+eq(GLOBAL_pvpSource, "client", "and named as the client's")
+
+GetPVPDesired = GLOBAL_realDesired
+GLOBAL_pvpDesired, GLOBAL_pvpSource = frames:PVPDesired()
+eq(GLOBAL_pvpSource, "toggle", "without it, the toggle is the source")
+frames.pvpDesired = nil
+eq(select(2, frames:PVPDesired()), "unknown", "and with neither, it says so")
+
+--[==[ **The toggle is wrapped, not replaced**, and recognised through a global
+     so a reload wraps what the last one wrapped rather than stacking on it --
+     the lesson the tooltip's OnShow wrapper had to learn after the suite
+     overflowed the stack on it. ]==]
+--[[ Already taken over: the hook goes on at PLAYER_ENTERING_WORLD, which is
+     every login and every reload. ]]--
+eq(TogglePVP, EquadisOverhaulTogglePVP, "the toggle is already ours from login")
+GLOBAL_toggleWrapper = TogglePVP
+eq(frames:InstallPVPToggleHook(), false, "and a second install is not a second layer")
+eq(TogglePVP, GLOBAL_toggleWrapper, "the same wrapper is still in place")
+check(EquadisOverhaulTogglePVPInner ~= nil, "with the client's own call kept")
+
+frames.pvpDesired = false
+TogglePVP()
+eq(frames:PVPDesired(), true, "and calling it is what sets the desired flag")
+
+
+Stub.clockOffset = 0
+frames:ClearPVPGrace()
+frames.pvpDesired = false
+Stub.pvp.flagged = true
+frames.pvpWasFlagged = true
 
 --[==[ **And a client that does answer is believed over our arithmetic.** ]==]
 GetPVPTimer = GLOBAL_realPVPTimer
@@ -36012,12 +39670,31 @@ OB.profile.modules.tooltip.fontOutline = false
 OB.profile.fontOutline = false
 
 GLOBAL_sets = 0
+--[[ **It has to remember all three, because a real FontString does.**
+
+     This kept only the path and answered `GetFont` with it alone. That was
+     enough while the skip compared a note ECO wrote on the side; it is not
+     enough now that the skip asks the string what its font actually is -- a
+     string that forgets its size and outline reports a change on every call and
+     can never settle. No FontString behaves that way. ]]--
 GLOBAL_fs = {
     SetFont = function(self, path, size, outline)
         GLOBAL_sets = GLOBAL_sets + 1
-        self.font = path
+        self.font, self.fontSize, self.fontFlags = path, size, outline
     end,
-    GetFont = function(self) return self.font end,
+    GetFont = function(self)
+        return self.font, self.fontSize, self.fontFlags
+    end,
+
+    --[[ The client's own way of changing a font, which takes the size and flags
+         with it. Modelled here for the same reason the stub models it: it is how
+         the tooltip's first line gets its header face, behind this addon's
+         back. ]]--
+    SetFontObject = function(self, object)
+        self.font = "object:" .. tostring(object)
+        self.fontSize = nil
+        self.fontFlags = nil
+    end,
 }
 
 OB.ApplyFont(GLOBAL_fs, 12, "tooltip")
@@ -36028,6 +39705,46 @@ for GLOBAL_i = 1, 20 do
 end
 
 eq(GLOBAL_sets, 1, "and twenty more calls set it no further times")
+
+--[==[ **And a font changed behind this addon's back is put back.**
+
+     Ollie, 2026-09-30: *"hover tt name is higher font size than fade tt / hover
+     tt has no text border. fade tt does"*.
+
+     The skip used to compare three fields ECO had written on the FontString the
+     last time it styled it. That is a note about what was asked for, not about
+     what the string is -- and the client changes tooltip fonts without asking:
+     building a tooltip with `SetText` re-applies `GameTooltipHeaderText` to
+     line one, **after** ECO has styled it. The note still matched, the skip
+     returned early, and the header font stayed.
+
+     Two tooltips showing the same item side by side then disagreed about the
+     first line: the live one wearing the client's bigger header face, the fade
+     copy -- built with `AddLine`, which gets no header treatment -- wearing
+     ECO's. Which is precisely what was reported. ]==]
+GLOBAL_fs:SetFontObject("GameTooltipHeaderText")
+check(select(2, GLOBAL_fs:GetFont()) == nil,
+        "the client's font object takes the size with it")
+
+OB.ApplyFont(GLOBAL_fs, 12, "tooltip")
+eq(GLOBAL_sets, 2, "so the next pass restyles rather than skipping")
+eq(select(2, GLOBAL_fs:GetFont()), 12, "and the size is this addon's again")
+
+OB.ApplyFont(GLOBAL_fs, 12, "tooltip")
+eq(GLOBAL_sets, 2, "and it settles again afterwards")
+
+--[[ The same for anything else that restyles a shared line -- another addon, a
+     template reset. The skip asks the string, so it does not matter what did
+     it. ]]--
+GLOBAL_fs:SetFont("Fonts\\FRIZQT__.TTF", 20, "THICKOUTLINE")
+OB.ApplyFont(GLOBAL_fs, 12, "tooltip")
+eq(select(2, GLOBAL_fs:GetFont()), 12,
+        "another addon's restyle is undone too")
+
+--[[ The assertions below count from a string that has been styled once at
+     twelve, which is where this leaves it -- the counter is put back so they
+     read as they were written. ]]--
+GLOBAL_sets = 1
 
 --[[ It is a skip, not a freeze: a size that actually changed has to land. ]]--
 OB.ApplyFont(GLOBAL_fs, 14, "tooltip")
@@ -36047,6 +39764,98 @@ eq(GLOBAL_sets, 3, "once")
 end
 
 lookCacheTests()
+
+function GLOBAL_FontFailureTests()
+
+context = "fonts: "
+
+--[==[ **A font that will not load must not leave the string without one.**
+
+     Ollie's `/eq selftest` on 2026-09-28: **3 of 348 font strings have no
+     font**, and unnamed, because a string with no font usually has no text to
+     name it by either.
+
+     In 1.12 a FontString with no font object is not merely unstyled --
+     colouring or measuring one is an **error**, which is the fault `OB.NewText`
+     and this registry exist to prevent. `SetFont` fails silently on a size of
+     zero or below and on a file the client cannot load, and it leaves no font
+     at all rather than the previous one.
+
+     None of this could be reached from the suite until today: the harness's
+     `SetFont` stored whatever it was handed, so `GetFont` always answered and
+     the fallbacks below were unreachable code that looked covered. ]==]
+GLOBAL_fontFs = OB.NewText(UIParent, "OVERLAY")
+check(GLOBAL_fontFs:GetFont() ~= nil, "a new font string starts with a font")
+
+--[==[ **The custom font failing falls back to the client's own.** ]==]
+Stub.missingFonts = { ["Interface\\AddOns\\EquadisClassicOverhaul\\media\\Roboto.ttf"] = true }
+GLOBAL_fontPath = OB.FontPath("tooltip")
+Stub.missingFonts = { [GLOBAL_fontPath] = true }
+
+OB.ApplyFont(GLOBAL_fontFs, 12, "tooltip")
+check(GLOBAL_fontFs:GetFont() ~= nil,
+        "a font the client cannot load falls back rather than blanking",
+        tostring(GLOBAL_fontFs:GetFont()))
+
+--[==[ **And a failure is not remembered as a success.**
+
+     This is the half that made three strings stay broken. `ApplyFont` recorded
+     the path, size and outline whatever happened, so a string left with no font
+     was cached as though it had one -- and the short-circuit at the top matched
+     on every later pass and returned without trying again. **One failure made
+     it permanent.** ]==]
+GLOBAL_fontBad = OB.NewText(UIParent, "OVERLAY")
+Stub.missingFonts = { [GLOBAL_fontPath] = true,
+        [STANDARD_TEXT_FONT] = true }
+
+OB.ApplyFont(GLOBAL_fontBad, 12, "tooltip")
+eq(GLOBAL_fontBad:GetFont(), nil,
+        "with every font unloadable there is genuinely nothing to set")
+eq(GLOBAL_fontBad.eqEcoFontPath, nil,
+        "and the failure is not recorded as though it worked")
+
+--[[ So the next pass tries again, and succeeds once a font is loadable. ]]--
+Stub.missingFonts = {}
+OB.ApplyFont(GLOBAL_fontBad, 12, "tooltip")
+check(GLOBAL_fontBad:GetFont() ~= nil,
+        "so the next pass repairs it rather than skipping it",
+        tostring(GLOBAL_fontBad:GetFont()))
+
+--[==[ **A size the client will not take does not strip the font either.**
+
+     `SetFont` fails on zero or below. A size that is not a usable number is a
+     bug somewhere else and must not be allowed to break the string here. ]==]
+GLOBAL_fontZero = OB.NewText(UIParent, "OVERLAY")
+OB.ApplyFont(GLOBAL_fontZero, 0, "tooltip")
+check(GLOBAL_fontZero:GetFont() ~= nil,
+        "a size of zero is corrected rather than obeyed",
+        tostring(select(2, GLOBAL_fontZero:GetFont())))
+
+GLOBAL_fontNeg = OB.NewText(UIParent, "OVERLAY")
+OB.ApplyFont(GLOBAL_fontNeg, -4, "tooltip")
+check(GLOBAL_fontNeg:GetFont() ~= nil, "and so is a negative one")
+
+--[==[ **Every registered string ends up with a font.** The registry exists so
+     the self-test can make this one proposition about the whole interface
+     rather than trusting each caller, and it is the proposition that failed on
+     Ollie's client. ]==]
+GLOBAL_fontless = 0
+function GLOBAL_CountFontless()
+    local n = 0
+    for i = 1, table.getn(OB.texts) do
+        if not OB.texts[i]:GetFont() then n = n + 1 end
+    end
+    return n
+end
+
+eq(GLOBAL_CountFontless(), 0, "no registered font string is left without a font",
+        tostring(GLOBAL_CountFontless()) .. " of " .. tostring(table.getn(OB.texts)))
+
+Stub.missingFonts = {}
+
+end
+
+GLOBAL_FontFailureTests()
 
 -- 67. the health bar is not re-anchored three hundred times a second
 --
@@ -36286,6 +40095,278 @@ GameTooltip.lineCount = 1
 GameTooltipTextLeft1:SetText("Thunderfury")
 
 end
+
+--[==[ **The fade is the same size as the tooltip it is fading out.**
+
+     Ollie, 2026-09-24: *"still different when hovered and the last hover fade.
+     dimensions are different."*
+
+     The fade is a **second frame** carrying a copy of the lines, and the copy
+     is sized from whatever the live tooltip measured **at the moment the
+     snapshot was taken**. That is not the moment the mouse leaves. ECO
+     re-measures the live tooltip from its own pass -- a price row arriving, a
+     unit line being rewritten -- so anything that changes its width after the
+     last snapshot leaves the copy holding a stale number, and the tooltip
+     visibly changes size the instant it starts to fade.
+
+     Driven the way it actually happens: fill, measure, snapshot, **then** let
+     the live one grow, then fade. ]==]
+--[[ Global, not local: this chunk is on Lua's two-hundred-local ceiling and
+     one more name at file scope fails the whole file. ]]--
+function GLOBAL_FadeSizeTests()
+
+context = "tooltip fade: "
+
+GLOBAL_tt = OB.modules.tooltip
+GLOBAL_tt:CancelFade()
+GLOBAL_tt.fadeCacheValid = nil
+
+GameTooltip:Hide()
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetText("Arcanite Reaper")
+GameTooltip:AddLine("Binds when picked up")
+GameTooltip:Show()
+GLOBAL_tt:Resize(GameTooltip)
+
+check(GLOBAL_tt:SnapshotForFade(GameTooltip, true), "a snapshot is taken")
+GLOBAL_fadeTip = GLOBAL_tt.fadeTooltip
+check(GLOBAL_fadeTip ~= nil, "and there is a copy to fade")
+
+eq(GLOBAL_fadeTip:GetWidth(), GameTooltip:GetWidth(),
+        "the copy is the width of the tooltip it came from",
+        tostring(GLOBAL_fadeTip:GetWidth()) .. " vs "
+                .. tostring(GameTooltip:GetWidth()))
+
+--[==[ **Now the live tooltip grows after the snapshot**, which is the ordinary
+     case rather than a contrived one: ECO appends its own rows as the answers
+     arrive -- a vendor price, an auction line -- and re-measures. A much longer
+     line is used here so the difference cannot hide inside rounding. ]==]
+GameTooltip:AddLine("Sells to a vendor for a great deal more than you would think")
+GLOBAL_tt:Resize(GameTooltip)
+GLOBAL_liveWidth = GameTooltip:GetWidth()
+
+check(GLOBAL_liveWidth > GLOBAL_fadeTip:GetWidth(),
+        "the live tooltip is now wider than the copy taken before it grew",
+        tostring(GLOBAL_liveWidth) .. " vs "
+                .. tostring(GLOBAL_fadeTip:GetWidth()))
+
+--[==[ **And the fade has to start at the size the player was just looking at.**
+
+     This is the whole of the report. Whatever the copy was measured at, the
+     frame that appears when the mouse leaves must be the size of the one that
+     was on screen a moment earlier, or the tooltip jumps as it fades. ]==]
+GLOBAL_tt.fadeCacheValid = true
+check(GLOBAL_tt:StartCachedFade(), "the fade starts")
+
+eq(GLOBAL_fadeTip:GetWidth(), GLOBAL_liveWidth,
+        "and it is the size the tooltip was when the mouse left",
+        tostring(GLOBAL_fadeTip:GetWidth()) .. " vs "
+                .. tostring(GLOBAL_liveWidth))
+eq(GLOBAL_fadeTip:GetHeight(), GameTooltip:GetHeight(),
+        "in height as well as width",
+        tostring(GLOBAL_fadeTip:GetHeight()) .. " vs "
+                .. tostring(GameTooltip:GetHeight()))
+
+--[==[ **And the lines inside it are laid out the same, not just the box.**
+
+     v0.99.330 pinned the copy's width and height and stopped the box changing
+     size. It did not touch what is *inside* the box. `Resize` is what decides a
+     tooltip's layout in this addon -- it measures every rendered string and
+     gives a two-column row whatever is left after its right-hand value, setting
+     `SetWidth` on the line itself so long text wraps inside the backdrop
+     instead of painting past it. The live tooltip goes through that. The copy
+     never did: it got `StyleText` and two frame dimensions.
+
+     So the box stopped changing size and the text inside it still moved, which
+     is what "still not fixed" means. Asserted line by line, because that is the
+     level the difference lives at. ]==]
+eq(GLOBAL_fadeTip:NumLines(), GameTooltip:NumLines(),
+        "the copy carries the same number of lines",
+        tostring(GLOBAL_fadeTip:NumLines()) .. " vs "
+                .. tostring(GameTooltip:NumLines()))
+
+--[==[ **The lines say the same thing, which is the part the harness can
+     honestly answer.**
+
+     Comparing the *width* of each line was tried here and measures nothing
+     real: a FontString the addon has not explicitly clamped answers
+     `GetWidth()` with **0** in this harness, where the client answers with the
+     width it actually rendered. So a clamped live line read 120 against the
+     copy's 0 with both holding the identical string -- a difference invented by
+     the model, not found in the addon.
+
+     What is real and was genuinely broken is **which lines exist at all**,
+     asserted above, and what they say, asserted here. Per-line geometry needs
+     the harness to measure text, and until it does, an assertion about it would
+     be a test of the stub. ]==]
+function GLOBAL_FadeLineTexts(frame)
+    local out = {}
+    local name = frame:GetName()
+
+    for i = 1, (frame:NumLines() or 0) do
+        local fs = getglobal(name .. "TextLeft" .. i)
+        out[i] = fs and fs.GetText and fs:GetText() or nil
+    end
+
+    return out
+end
+
+function GLOBAL_FadeTextMismatch()
+    local live = GLOBAL_FadeLineTexts(GameTooltip)
+    local copy = GLOBAL_FadeLineTexts(GLOBAL_fadeTip)
+
+    for i = 1, table.getn(live) do
+        if live[i] ~= copy[i] then
+            return i, tostring(live[i]) .. " vs " .. tostring(copy[i])
+        end
+    end
+
+    return nil
+end
+
+GLOBAL_fadeBadLine, GLOBAL_fadeBadWhy = GLOBAL_FadeTextMismatch()
+eq(GLOBAL_fadeBadLine, nil,
+        "and every line of the fade says what the live tooltip said",
+        tostring(GLOBAL_fadeBadWhy))
+
+--[==[ **The two states wear the same chrome, because it is the same code.**
+
+     Ollie, 2026-09-29: *"tooltip vs fading tooltip that exists after mouse off.
+     fading has text border. these 2 states should share the EXACT same
+     settings."*
+
+     They did not share code. The live tooltip was styled by `StyleTooltip` and
+     the fade copy restyled itself inside `SnapshotForFade` -- the same calls
+     written out a second time, already differing in small ways: the background
+     fell back to a literal rather than to `DEFAULT_TOOLTIP_BG`, and the border
+     went on before the colour rather than after.
+
+     **Two implementations of one job is the fault**, whichever is wrong today.
+     A setting added to one and forgotten in the other is invisible while the
+     mouse is still, and shows the instant it moves away -- the one moment both
+     are on screen together.
+
+     Asserted property by property rather than by trusting the refactor, and
+     across several settings, because "the same" has to survive the settings
+     changing. ]==]
+function GLOBAL_ChromeOf(frame)
+    return {
+        backdrop = frame.GetBackdrop and frame:GetBackdrop() or nil,
+        colour = frame.backdropColor,
+        border = frame.backdropBorder,
+        scale = frame.GetScale and frame:GetScale() or nil,
+    }
+end
+
+function GLOBAL_ChromeMismatch()
+    GLOBAL_tt:SnapshotForFade(GameTooltip, true)
+
+    local live = GLOBAL_ChromeOf(GameTooltip)
+    local copy = GLOBAL_ChromeOf(GLOBAL_tt.fadeTooltip)
+
+    if live.backdrop ~= copy.backdrop then
+        return "backdrop: " .. tostring(live.backdrop)
+                .. " vs " .. tostring(copy.backdrop)
+    end
+    if live.scale ~= copy.scale then
+        return "scale: " .. tostring(live.scale) .. " vs " .. tostring(copy.scale)
+    end
+
+    for _, field in ipairs({ "colour", "border" }) do
+        local a, b = live[field], copy[field]
+
+        if (a == nil) ~= (b == nil) then
+            return field .. ": one is set and the other is not"
+        end
+
+        if a and b then
+            for i = 1, 4 do
+                if a[i] ~= b[i] then
+                    return field .. "[" .. i .. "]: " .. tostring(a[i])
+                            .. " vs " .. tostring(b[i])
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_ChromeMismatch(), nil, "the fade wears the live tooltip's chrome")
+
+--[==[ **And it keeps wearing it when the settings change.** This is the half a
+     refactor alone does not buy: the copy has to be styled from the same source
+     of truth, not merely to have matched once. ]==]
+GLOBAL_ttCfg = OB.profile.modules.tooltip
+
+GLOBAL_ttCfg.border = 3
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_ChromeMismatch(), nil, "with a heavier border")
+
+GLOBAL_ttCfg.backgroundColor = { 0.1, 0.12, 0.22, 0.8 }
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_ChromeMismatch(), nil, "with a background colour of somebody's own")
+
+GLOBAL_ttCfg.scale = 1.25
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_ChromeMismatch(), nil, "and at a scale of their own")
+
+--[==[ **The text too**, at whatever outline the profile says. A "text border"
+     is what an outline looks like on one state and not the other, and the font
+     is the other half of "the same settings". ]==]
+function GLOBAL_FadeFontMismatch()
+    GLOBAL_tt:SnapshotForFade(GameTooltip, true)
+
+    local copy = GLOBAL_tt.fadeTooltip
+    local liveName = GameTooltip:GetName()
+    local copyName = copy:GetName()
+
+    for i = 1, (GameTooltip:NumLines() or 0) do
+        local a = getglobal(liveName .. "TextLeft" .. i)
+        local b = getglobal(copyName .. "TextLeft" .. i)
+
+        if a and b then
+            local ap, as, af = a:GetFont()
+            local bp, bs, bf = b:GetFont()
+
+            if ap ~= bp or as ~= bs or af ~= bf then
+                return "line " .. i .. ": " .. tostring(ap) .. "/" .. tostring(as)
+                        .. "/" .. tostring(af) .. " vs " .. tostring(bp)
+                        .. "/" .. tostring(bs) .. "/" .. tostring(bf)
+            end
+        end
+    end
+
+    return nil
+end
+
+OB.profile.fontOutline = 1
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_FadeFontMismatch(), nil, "the fade's text matches with no outline")
+
+OB.profile.fontOutline = 2
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_FadeFontMismatch(), nil, "and with one")
+
+OB.profile.fontOutline = 3
+GLOBAL_tt:StyleTooltip(GameTooltip)
+eq(GLOBAL_FadeFontMismatch(), nil, "and with a thick one")
+
+OB.profile.fontOutline = 2
+GLOBAL_ttCfg.scale = 1
+GLOBAL_ttCfg.border = 1
+GLOBAL_ttCfg.backgroundColor = nil
+GLOBAL_tt:StyleTooltip(GameTooltip)
+
+GLOBAL_tt:CancelFade()
+GameTooltip:Hide()
+GameTooltip.lineCount = 1
+GameTooltipTextLeft1:SetText("Thunderfury")
+
+end
+
+GLOBAL_FadeSizeTests()
 
 fadeSnapshotTests()
 
@@ -39066,6 +43147,23 @@ eq(GLOBAL_gear.spellHit, 1, "spell hit likewise")
 eq(GLOBAL_gear.spellPower, 10, "and spell power")
 eq(GLOBAL_gear.schools["Fire"], 5, "and the school")
 
+--[==[ **And none of it rests on `NumLines`.** In game the count came back
+     nought for the scanning tooltip and the hit row read a flat zero -- forty
+     lines of nothing. The scan blanks the lines itself before the client
+     writes, so a count that says nothing changes nothing. ]==]
+GLOBAL_realNumLines = OB.ScanTooltip().NumLines
+OB.ScanTooltip().NumLines = function() return 0 end
+GLOBAL_gear = GLOBAL_sheet:GearBonuses(true)
+eq(GLOBAL_gear.hit, 2, "with NumLines answering nought the gear is still read",
+        tostring(GLOBAL_gear.hit))
+OB.ScanTooltip().NumLines = GLOBAL_realNumLines
+
+--[[ And the tooltip is owned afresh for every scan, which is what the
+     client's own scanners do and what a hidden tooltip may need. ]]--
+GLOBAL_sheet:GearBonuses(true)
+eq(select(2, OB.ScanTooltip():GetOwner()), "ANCHOR_NONE",
+        "the scanning tooltip is owned, anchored nowhere")
+
 --[==[ **The same for a talent**: Precision's tooltip is six lines and the
      next talent's three, and the first line left over is Precision's own
      sentence. Read to the first nil, that is a second Precision. ]==]
@@ -39183,6 +43281,42 @@ eq(select(1, GameTooltip:GetOwner()), GLOBAL_left.rows[GLOBAL_hitIndex].hover,
 Stub.Unhover(GLOBAL_left.rows[GLOBAL_hitIndex].hover)
 check(not GameTooltip:IsShown(), "and leaving the row puts it away")
 
+--[==[ **A stat row starts its own tooltip rather than joining the last one.**
+
+     `SetOwner` does not empty a tooltip on this client; the client's own code
+     always follows it with `SetText`, which is the call that drops what was
+     there -- `PaperDollStatTooltip` and `CharacterDamageFrame_OnEnter` both.
+     Opening with `AddLine` instead appended the row to whatever was last
+     shown, so a stat hovered straight after an equipped slot read as that
+     item's tooltip with a stat stuck on the end, and crossing from row to row
+     grew it a line at a time. ]==]
+Stub.itemIds["Row Neighbour"] = 200
+Stub.tooltips["item16"] = { "Row Neighbour" }
+
+GameTooltip:Hide()
+Stub.Tick(0.05, 3)
+GameTooltip:SetOwner(UIParent, "ANCHOR_RIGHT")
+GameTooltip:SetInventoryItem("player", 16)
+GameTooltip:Show()
+Stub.Tick(0.05, 5)
+check(GameTooltip:NumLines() > 1, "an item tooltip is up beside the sheet")
+
+Stub.Hover(GLOBAL_left.rows[GLOBAL_hitIndex].hover)
+
+eq(getglobal("GameTooltipTextLeft1"):GetText(), "Hit: 7.00%",
+        "the row's own line is the first line")
+GLOBAL_rowText = {}
+for GLOBAL_i = 1, GameTooltip:NumLines() do
+    table.insert(GLOBAL_rowText,
+            tostring(getglobal("GameTooltipTextLeft" .. GLOBAL_i):GetText()))
+end
+GLOBAL_rowText = table.concat(GLOBAL_rowText, " | ")
+check(string.find(GLOBAL_rowText, "Row Neighbour", 1, true) == nil,
+        "and nothing of the item it replaced is left on it", GLOBAL_rowText)
+
+Stub.Unhover(GLOBAL_left.rows[GLOBAL_hitIndex].hover)
+Stub.tooltips["item16"] = nil
+
 --[==[ **A row that errors says so instead of vanishing.** It used to be
      dropped like a row the client could not answer, which is the one
      failure a stat sheet must not hide: "hit is missing" and "hit is
@@ -39236,6 +43370,16 @@ Stub.player.talents["2:9"] = nil
 Stub.tooltips["talent2:3"] = nil
 Stub.tooltips["talent2:9"] = nil
 GLOBAL_sheet:TalentBonuses(true)
+
+--[[ A fork whose hit call answers nought does not get to hide the gear. ]]--
+Stub.SetCritApi(true, 22.96, 0)
+GLOBAL_melee = GLOBAL_sheet:StatRows("melee")
+GLOBAL_have = {}
+for GLOBAL_i = 1, table.getn(GLOBAL_melee) do
+    GLOBAL_have[GLOBAL_melee[GLOBAL_i].label] = GLOBAL_melee[GLOBAL_i].value
+end
+eq(GLOBAL_have["Hit"], "2.00%", "a client call answering nought yields to the scan",
+        tostring(GLOBAL_have["Hit"]))
 
 --[[ And both appear the moment the client can answer, which is the whole
      point of asking rather than assuming. ]]--
@@ -39452,12 +43596,23 @@ check(not GLOBAL_left:IsShown(), "switching the panes off takes them away")
 check(getglobal("CharacterAttributesFrame"):IsShown(),
         "and gives the client its own back")
 
+
 GLOBAL_cfg.statPanes = true
 GLOBAL_sheet:ApplyStats()
 
 --[[ The diagnostic runs: it is what settles which calls a given client has, and
      a debug command that errors is one nobody can use at the moment they need
      it. ]]--
+--[==[ **The price debug runs and names the six places a price can go
+     missing.** It is the answer to "vendor prices missing from tooltip",
+     which from the front looks the same whether the switch is off, the item
+     could not be identified, or no provider knows it. A diagnostic that
+     errors is one nobody can use at the moment they need it. ]==]
+Stub.chat = {}
+check(pcall(function() OB.RunPriceDebug() end), "the price debug runs")
+check(string.find(table.concat(Stub.chat, " | "), "vendor baseline", 1, true) ~= nil,
+        "and says whether the baseline is loaded", table.concat(Stub.chat, " | "))
+
 Stub.chat = {}
 check(pcall(function() GLOBAL_sheet:DebugStats() end), "the stat debug runs")
 check(string.find(table.concat(Stub.chat, " | "), "GetCritChance", 1, true) ~= nil,
@@ -39473,6 +43628,450 @@ check(string.find(table.concat(Stub.chat, " | "),
 Stub.SetCritApi(false)
 
 end
+
+
+-- ---------------------------------------------------------------------------
+-- what's training
+-- ---------------------------------------------------------------------------
+
+context = "training: "
+
+--[==[ **The trainer's list, absorbed from What's Training? Turtle.**
+
+     Ollie, 2026-09-24, with the repository link: *"add this to ECO character
+     panel module"*. The tables are upstream's, verbatim, in `data/training/`;
+     the reading of them is ECO's.
+
+     Asserted as **data** before anything is drawn. Which of five buckets a
+     spell lands in is the whole feature -- it depends on the character's level,
+     on which ranks are already known, and on other spells being known first --
+     and none of that needs a frame to be wrong.
+
+     **Every loop here is inside a function on purpose.** This chunk sits on
+     Lua's two-hundred-local ceiling, and a generic `for` costs three hidden
+     slots on top of its named variables; three nested at file scope took the
+     whole suite out with "main function has more than 200 local variables". ]==]
+GLOBAL_trainDb = EquadisClassicOverhaulTrainingDB
+check(GLOBAL_trainDb ~= nil, "the training tables are loaded")
+
+function GLOBAL_TrainCounts()
+    local classes, spells, overrides = 0, 0, 0
+
+    for class, byLevel in pairs(GLOBAL_trainDb.spells) do
+        classes = classes + 1
+        for level, list in pairs(byLevel) do
+            spells = spells + table.getn(list)
+        end
+    end
+
+    for class, t in pairs(GLOBAL_trainDb.overrides) do
+        for id, list in pairs(t) do overrides = overrides + 1 end
+    end
+
+    return classes, spells, overrides
+end
+
+--[==[ **Counted against the upstream file, not eyeballed.** The conversion
+     rewrote two assignment lines per file and nothing else, so any drift is a
+     table that lost rows on the way in -- which reads in game as spells that
+     simply never appear, the one failure nobody reports because there is
+     nothing on screen to report. ]==]
+GLOBAL_trainClasses, GLOBAL_trainSpells, GLOBAL_trainOverrides
+        = GLOBAL_TrainCounts()
+
+eq(GLOBAL_trainClasses, 9, "all nine classes came across")
+eq(GLOBAL_trainSpells, 1453, "with every spell upstream has",
+        tostring(GLOBAL_trainSpells))
+eq(GLOBAL_trainOverrides, 217, "and every rank-override row",
+        tostring(GLOBAL_trainOverrides))
+
+--[[ Helpers the assertions below drive, each keeping its loops off the main
+     chunk's local budget. ]]--
+function GLOBAL_TrainCountIn(bucket, test)
+    local n = 0
+    for i = 1, table.getn(bucket or {}) do
+        if test(bucket[i]) then n = n + 1 end
+    end
+    return n
+end
+
+function GLOBAL_TrainHasId(cats, id)
+    for key, bucket in pairs(cats or {}) do
+        for i = 1, table.getn(bucket) do
+            if bucket[i].id == id then return true end
+        end
+    end
+    return false
+end
+
+function GLOBAL_TrainNamed(cats, text)
+    local n = 0
+    for key, bucket in pairs(cats or {}) do
+        for i = 1, table.getn(bucket) do
+            if string.find(bucket[i].name, text, 1, true) then n = n + 1 end
+        end
+    end
+    return n
+end
+
+function GLOBAL_TrainFindRaceSpell(class)
+    for level, list in pairs(GLOBAL_trainDb.spells[class] or {}) do
+        for i = 1, table.getn(list) do
+            if list[i].races then return list[i] end
+        end
+    end
+    return nil
+end
+
+--[==[ **`boot` hands back the addon table and `OB` has to be rebound to it.**
+
+     Every other section in this file writes `OB = boot(...)`; this one wrote
+     `boot(...)` and went on reading the previous `OB`. That is a **different,
+     still-perfectly-working addon table from an earlier character**, so the
+     assertions passed while driving a module the client's own frames no longer
+     point at -- and the moment a real hook fired, it acted on the live module
+     and the test looked at the stale one. Two tests failed and the code they
+     were testing was right. ]==]
+
+--[[ A warrior, level 20, knowing nothing at all: the plainest case there is. ]]--
+OB = boot("WARRIOR")
+GLOBAL_train = OB.modules.characterpanel
+Stub.player.level = 20
+Stub.player.race = "Human"
+Stub.player.spellNames = {}
+
+GLOBAL_trainCats = GLOBAL_train:TrainingCategories()
+check(GLOBAL_trainCats ~= nil, "a warrior has a training list")
+check(table.getn(GLOBAL_trainCats.available) > 0,
+        "with things to train at twenty",
+        tostring(table.getn(GLOBAL_trainCats.available)))
+eq(table.getn(GLOBAL_trainCats.known), 0, "and nothing known yet")
+
+--[==[ **Nothing above the character's level is offered as trainable**, and
+     coming soon is the next two levels only -- the span you would ride back
+     for. ]==]
+eq(GLOBAL_TrainCountIn(GLOBAL_trainCats.available,
+        function(s) return s.level > 20 end),
+        0, "nothing above the player's level is offered")
+
+eq(GLOBAL_TrainCountIn(GLOBAL_trainCats.soon,
+        function(s) return s.level <= 20 or s.level > 22 end),
+        0, "and coming soon is the next two levels only")
+
+--[==[ **A later rank stands for every rank below it.**
+
+     The single most visible way this list can be wrong: know Heroic Strike 6
+     and a list without the override table offers to sell you all five ranks
+     beneath it. The spellbook only ever answers a name and a rank, so that is
+     also the only join there is. ]==]
+Stub.player.spellNames = { { "Heroic Strike", "Rank 6" } }
+GLOBAL_trainKnown = GLOBAL_train:KnownTrainingIds()
+
+check(GLOBAL_trainKnown[11565], "the rank the book reports is known",
+        "11565 is Heroic Strike Rank 6")
+check(GLOBAL_trainKnown[78], "and rank 1 beneath it")
+check(GLOBAL_trainKnown[284], "and rank 2")
+check(GLOBAL_trainKnown[11564], "and every rank in between")
+check(not GLOBAL_trainKnown[11566],
+        "but not rank 7, which is still to be bought")
+
+--[==[ **And the rank is read rather than ignored.** The harness answered every
+     rank as an empty string until today, which makes a join on name *and* rank
+     look like it works while it is matching nothing. ]==]
+Stub.player.spellNames = { { "Heroic Strike", "Rank 1" } }
+GLOBAL_trainKnown = GLOBAL_train:KnownTrainingIds()
+check(GLOBAL_trainKnown[78], "rank 1 alone is known when rank 1 is the book's")
+check(not GLOBAL_trainKnown[11565],
+        "and rank 6 is not, on the same spell name")
+
+--[==[ **A spell whose earlier rank you never bought is not "available".**
+
+     It is a real state -- you out-level a rank you skipped -- and calling it
+     available sends somebody to a trainer who will not sell it to them. ]==]
+Stub.player.level = 60
+Stub.player.spellNames = {}
+GLOBAL_trainCats = GLOBAL_train:TrainingCategories()
+
+check(table.getn(GLOBAL_trainCats.missing) > 0,
+        "a sixty who knows nothing has ranks waiting behind other ranks",
+        tostring(table.getn(GLOBAL_trainCats.missing)))
+
+eq(GLOBAL_TrainCountIn(GLOBAL_trainCats.available,
+        function(s) return s.requiredIds and table.getn(s.requiredIds) > 0 end),
+        0, "and nothing with an unmet requirement is called available")
+
+--[==[ **The retired placeholder is not offered.** `zzOLD Pummel` is in the
+     upstream warrior table; `zz` is Blizzard's own marker for a spell that is
+     no longer real, and it is the one outright wrong row this list could
+     draw. ]==]
+eq(GLOBAL_TrainNamed(GLOBAL_trainCats, "zzOLD"), 0,
+        "the retired zzOLD placeholder is never offered")
+
+--[==[ **Race tokens meet whichever way either side spells them.**
+
+     The tables say `UNDEAD`, `NIGHTELF`, `HIGHELF`; `UnitRace` answers
+     `NightElf`, and 1.12 calls the Forsaken **`Scourge`** -- a spelling no data
+     file uses. One row upstream says `Gnome` where its neighbours say `GNOME`.
+     A literal comparison drops every race-restricted spell, and a list missing
+     rows looks exactly like a class that has none. ]==]
+Stub.player.race = { "Undead", "Scourge" }
+eq(GLOBAL_train:TrainingRace(), "UNDEAD",
+        "the client's Scourge is understood as Undead")
+
+Stub.player.race = { "Night Elf", "NightElf" }
+eq(GLOBAL_train:TrainingRace(), "NIGHTELF",
+        "and a two-word race folds to the table's spelling")
+
+--[[ **The priest**, because that is where the restriction actually lives: the
+     racial priest spells are 65 of the 87 race-locked rows in these tables, and
+     a warrior has none at all. Asserted on a class that has them rather than on
+     the one already booted, which would have passed by having nothing to
+     find. ]]--
+OB = boot("PRIEST")
+GLOBAL_train = OB.modules.characterpanel
+Stub.player.level = 60
+Stub.player.spellNames = {}
+
+GLOBAL_trainRaceSpell = GLOBAL_TrainFindRaceSpell("PRIEST")
+check(GLOBAL_trainRaceSpell ~= nil,
+        "the priest table has a race-restricted spell to test with")
+
+Stub.player.race = GLOBAL_trainRaceSpell.races[1]
+GLOBAL_trainCats = GLOBAL_train:TrainingCategories()
+check(GLOBAL_TrainHasId(GLOBAL_trainCats, GLOBAL_trainRaceSpell.id),
+        "a race-restricted spell reaches its own race",
+        tostring(GLOBAL_trainRaceSpell.races[1]) .. ": "
+                .. GLOBAL_trainRaceSpell.name)
+
+--[[ A race that is not on its list, chosen from the table's own spelling so
+     the negative is about the filter rather than about a typo here. ]]--
+Stub.player.race = "Tauren"
+GLOBAL_trainCats = GLOBAL_train:TrainingCategories()
+check(not GLOBAL_TrainHasId(GLOBAL_trainCats, GLOBAL_trainRaceSpell.id),
+        "and nobody else's")
+
+--[==[ **Every class has a list**, which is the cheapest guard against tables
+     that loaded but are keyed wrong. A class filed under a name `UnitClass`
+     never returns has no list at all, and an empty list is indistinguishable
+     from a quiet level. ]==]
+GLOBAL_trainClassList = { "WARRIOR", "ROGUE", "MAGE", "PRIEST", "WARLOCK",
+        "HUNTER", "DRUID", "PALADIN", "SHAMAN" }
+
+for GLOBAL_trainI = 1, table.getn(GLOBAL_trainClassList) do
+    OB = boot(GLOBAL_trainClassList[GLOBAL_trainI])
+    Stub.player.level = 40
+    Stub.player.race = "Human"
+    Stub.player.spellNames = {}
+
+    GLOBAL_trainOne = OB.modules.characterpanel:TrainingCategories()
+    check(GLOBAL_trainOne ~= nil
+            and table.getn(GLOBAL_trainOne.available) > 0,
+            "a " .. string.lower(GLOBAL_trainClassList[GLOBAL_trainI])
+                    .. " has spells to train at forty")
+end
+
+--[==[ **And the tab, on the spellbook.**
+
+     The code lives in the character panel module because that is where ECO
+     keeps what-am-I information; the tab belongs beside the spellbook, which is
+     where a player looks for a list of spells and where upstream put it. ]==]
+OB = boot("WARRIOR")
+GLOBAL_train = OB.modules.characterpanel
+Stub.player.level = 30
+Stub.player.race = "Human"
+Stub.player.spellNames = {}
+
+check(GLOBAL_train:ApplyTraining(), "the training tab is built")
+
+--[==[ **Held by the module rather than fetched by name.**
+
+     `getglobal` is the wrong handle *here* and nowhere else: this suite logs in
+     a hundred and twenty-odd times in one process, and a frame keeps its global
+     for the life of the run, so the name still points at the tab the previous
+     simulated character built. Asserting through it tested a dead frame and
+     said the panel would not open.
+
+     In game there is one login per session and one frame per name, which is why
+     the name itself is still worth asserting -- once, below. ]==]
+GLOBAL_trainTab = GLOBAL_train.trainingTab
+GLOBAL_trainPanel = GLOBAL_train.trainingPanel
+
+check(GLOBAL_trainTab ~= nil and GLOBAL_trainTab:IsShown(),
+        "and it is on the spellbook")
+eq(GLOBAL_trainTab:GetParent(), getglobal("SpellBookFrame"),
+        "parented to the spellbook itself")
+check(GLOBAL_trainPanel ~= nil, "with a panel behind it")
+check(not GLOBAL_trainPanel:IsShown(), "which starts closed")
+
+--[[ Named, because a frame other addons and macros may want to find needs a
+     name, and because ECO names every frame it owns. ]]--
+eq(GLOBAL_trainPanel:GetName(), "EquadisClassicOverhaulTrainingPanel",
+        "and the panel is named")
+
+GLOBAL_train:ToggleTrainingPanel(true)
+check(GLOBAL_trainPanel:IsShown(), "clicking the tab opens it")
+check(GLOBAL_trainPanel.rows[1]:IsShown(), "and there are rows in it")
+
+--[==[ **A spell row draws that spell's own icon.**
+
+     Half of what was reported as bugged icons was the client's page showing
+     through; this is the other half of the question, asked directly. The row's
+     texture has to be the icon named in the table -- not empty, not the header
+     row's, and not whatever the row drew last time it was scrolled past. ]==]
+function GLOBAL_TrainFirstSpellRow()
+    for i = 1, table.getn(GLOBAL_trainPanel.rows) do
+        local row = GLOBAL_trainPanel.rows[i]
+        if row.entry and row.entry.spell then return row end
+    end
+    return nil
+end
+
+GLOBAL_trainRow = GLOBAL_TrainFirstSpellRow()
+check(GLOBAL_trainRow ~= nil, "a spell row is drawn")
+check(GLOBAL_trainRow.icon:IsShown(), "with its icon shown")
+eq(GLOBAL_trainRow.icon:GetTexture(), GLOBAL_trainRow.entry.spell.icon,
+        "and it is that spell's own icon",
+        tostring(GLOBAL_trainRow.icon:GetTexture()))
+check(string.find(GLOBAL_trainRow.icon:GetTexture(), "Interface", 1, true) == 1,
+        "which is a real texture path",
+        tostring(GLOBAL_trainRow.icon:GetTexture()))
+
+--[[ A header carries no icon, and a row that was a spell a moment ago must not
+     keep showing one when it becomes a header. ]]--
+function GLOBAL_TrainFirstHeaderRow()
+    for i = 1, table.getn(GLOBAL_trainPanel.rows) do
+        local row = GLOBAL_trainPanel.rows[i]
+        if row.entry and row.entry.header then return row end
+    end
+    return nil
+end
+
+GLOBAL_trainHead = GLOBAL_TrainFirstHeaderRow()
+check(GLOBAL_trainHead ~= nil, "a section header is drawn")
+check(not GLOBAL_trainHead.icon:IsShown(), "and it carries no icon")
+
+--[==[ **The book's own page is put away while the list is up.**
+
+     Reported by Ollie the day v0.99.327 shipped: *"whats training icons are
+     bugged. normal spells still show"*. Two symptoms and one cause -- a frame
+     laid over the spellbook **covers nothing**. 1.12 keeps the twelve spell
+     buttons, the page number and the skill-line tabs as *siblings* of anything
+     an addon adds, so the client's page went on drawing underneath and its
+     37-pixel spell icons sat behind this list's 14-pixel ones. The bugged icons
+     were the client's own.
+
+     The first version of these tests asserted the two page buttons and nothing
+     else, which is why it passed: the two things it named were the two things
+     the code hid. ]==]
+function GLOBAL_TrainBookShown()
+    local shown, hidden = 0, 0
+
+    for i = 1, SPELLS_PER_PAGE do
+        local b = getglobal("SpellButton" .. i)
+        if b:IsShown() then shown = shown + 1 else hidden = hidden + 1 end
+    end
+
+    return shown, hidden
+end
+
+function GLOBAL_TrainTabsChecked()
+    local n = 0
+    for i = 1, MAX_SKILLLINE_TABS do
+        local t = getglobal("SpellBookSkillLineTab" .. i)
+        if t and t:GetChecked() then n = n + 1 end
+    end
+    return n
+end
+
+GLOBAL_trainShown, GLOBAL_trainHidden = GLOBAL_TrainBookShown()
+eq(GLOBAL_trainShown, 0, "every spell button is put away while the list is up",
+        tostring(GLOBAL_trainShown) .. " still drawn")
+eq(GLOBAL_trainHidden, SPELLS_PER_PAGE, "all twelve of them")
+
+check(not getglobal("SpellBookPageText"):IsShown(),
+        "and the page number with them")
+check(not getglobal("SpellBookPrevPageButton"):IsShown(),
+        "and the page buttons")
+
+--[[ The skill-line tabs stay put -- they are the way back to the book -- but
+     none of them is the open one while this list is what is open. ]]--
+eq(GLOBAL_TrainTabsChecked(), 0, "and no skill-line tab reads as selected")
+check(getglobal("SpellBookSkillLineTab1"):IsShown(),
+        "while the tabs themselves stay where they are")
+
+GLOBAL_train:ToggleTrainingPanel(false)
+
+GLOBAL_trainShown = GLOBAL_TrainBookShown()
+eq(GLOBAL_trainShown, SPELLS_PER_PAGE,
+        "closing the list hands every button back",
+        tostring(GLOBAL_trainShown) .. " of " .. tostring(SPELLS_PER_PAGE))
+check(getglobal("SpellBookPageText"):IsShown(), "and the page number")
+check(getglobal("SpellBookPrevPageButton"):IsShown(), "and the page buttons")
+
+--[==[ **Handed back by showing, and not filled in by hand.**
+
+     `SpellButton_UpdateButton` starts `if not this:IsVisible() then return
+     end`, and it is what paints the icon, the name and the rank. A button an
+     addon hides stops being repainted, so the client's own `OnShow` is what has
+     to fill it again -- which is why the restore is `Show()` and nothing else,
+     and why it must not try to empty or populate a button itself. ]==]
+eq(getglobal("SpellButton1").contentsShown, true,
+        "with the client left to fill them")
+
+--[==[ **Clicking a skill-line tab goes back to the book.**
+
+     The tab is the obvious way out and it did nothing: the list stayed up with
+     the client's page hidden underneath it. The client's own handler is chained
+     rather than replaced, because it is what actually changes the page. ]==]
+GLOBAL_train:ToggleTrainingPanel(true)
+check(GLOBAL_trainPanel:IsShown(), "the list is up again")
+
+Stub.Click(getglobal("SpellBookSkillLineTab2"))
+check(not GLOBAL_trainPanel:IsShown(),
+        "clicking a skill-line tab closes the list")
+
+GLOBAL_trainShown = GLOBAL_TrainBookShown()
+eq(GLOBAL_trainShown, SPELLS_PER_PAGE, "and gives the book its page back")
+
+--[==[ **And closing the spellbook closes this with it**, or the next open is
+     the list again with the client's page hidden under it and no way back --
+     `ToggleTrainingPanel` being the only thing that hands those parts out. ]==]
+GLOBAL_train:ToggleTrainingPanel(true)
+check(GLOBAL_trainPanel:IsShown(), "the list is up once more")
+
+getglobal("SpellBookFrame"):Show()
+getglobal("SpellBookFrame"):Hide()
+
+check(not GLOBAL_trainPanel:IsShown(),
+        "shutting the spellbook closes the list")
+GLOBAL_trainShown = GLOBAL_TrainBookShown()
+eq(GLOBAL_trainShown, SPELLS_PER_PAGE,
+        "so the book opens on its own page next time")
+
+GLOBAL_train:ToggleTrainingPanel(true)
+
+--[==[ **Scrolled by moving what is drawn** -- fourteen row frames over a list
+     of hundreds -- and it stops at both ends rather than running off. ]==]
+GLOBAL_train:ToggleTrainingPanel(true)
+eq(GLOBAL_train.trainingOffset, 0, "the list opens at the top")
+eq(GLOBAL_train:ScrollTraining(-1), false, "and will not scroll above it")
+
+check(GLOBAL_train:ScrollTraining(3), "it scrolls down")
+eq(GLOBAL_train.trainingOffset, 3, "by as much as it was asked for")
+
+GLOBAL_train:ScrollTraining(100000)
+check(GLOBAL_train.trainingOffset < table.getn(GLOBAL_train.trainingRows),
+        "and stops at the bottom rather than past it",
+        tostring(GLOBAL_train.trainingOffset) .. " of "
+                .. tostring(table.getn(GLOBAL_train.trainingRows)))
+eq(GLOBAL_train:ScrollTraining(1), false, "which is the end of it")
+
+--[[ Switching it off takes the tab away and leaves the book alone. ]]--
+OB.profile.modules.characterpanel.showTraining = false
+GLOBAL_train:ApplyTraining()
+check(not GLOBAL_trainTab:IsShown(), "switching it off takes the tab away")
+check(not GLOBAL_trainPanel:IsShown(), "and closes the list with it")
+OB.profile.modules.characterpanel.showTraining = true
 
 -- 62. dragging the camera from on top of a frame
 -- ---------------------------------------------------------------------------

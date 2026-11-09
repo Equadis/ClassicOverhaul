@@ -28,7 +28,11 @@ local function Say(msg) OB.Print(msg, "QoL") end
 
 local M = OB.RegisterModule({
     id = "qol",
-    name = "Automation",
+    --[[ Renamed from "Automation" on 2026-09-30. The page had grown a camera
+         section, vendor buttons and a bag border -- none of which automate
+         anything -- and a name that describes half its contents sends people
+         looking elsewhere for the rest. ]]--
+    name = "Misc",
 
     feature = true,
     renders = "none",
@@ -63,6 +67,19 @@ local M = OB.RegisterModule({
         rarityBorders = true,
 
         cameraSpeed = false,
+
+        --[==[ **How far one press of Fine Zoom moves the camera**, from
+             FineZoom by Stormhand (MIT). See NOTICE.
+
+             The client's own wheel zoom moves in one fixed jump and there is no
+             CVar for it, which is the whole reason that addon exists: the only
+             way to a finer step in 1.12 is a binding of your own that calls
+             `CameraZoomIn` with a number.
+
+             Upstream's default and its limits, kept: a fifth of a step, and
+             nothing outside 0.05 to 5 -- below that a press does nothing
+             visible, above it there is no point having the feature. ]==]
+        zoomStep = 0.2,
         cameraYaw = 180,
 
         --[[ **Turning the character model by dragging it.**
@@ -261,6 +278,32 @@ local M = OB.RegisterModule({
         { "Turn Speed", "cameraYaw", "slider", 90, 540, 10,
           nil, nil, "!cameraSpeed" },
 
+        --[==[ **Fine zoom**, absorbed from FineZoom by Stormhand.
+
+             The step is a setting because that is what it is; the two zooms are
+             **key bindings** because 1.12 gives no other way to reach them --
+             the wheel's own zoom is the client's and cannot be reassigned from
+             Lua. They appear under "Equadis' Overhaul: Camera" in the client's
+             own Key Bindings screen.
+
+             The button below is the one convenience upstream offered as
+             `/fzbind`: it puts the wheel on those two bindings, which is what
+             almost everybody wants and what nobody wants to do twice. ]==]
+        { "Fine Zoom Step", "zoomStep", "slider", 5, 500, 5, 0.01 },
+
+        { "Bind Mouse Wheel To Fine Zoom", "__camera_fzbind", "action",
+          function()
+              local m = OB.modules and OB.modules.qol
+              if m then m:BindWheelToFineZoom() end
+          end,
+          function()
+              local m = OB.modules and OB.modules.qol
+              if m and m:WheelIsFineZoom() then
+                  return "Mouse Wheel Is Fine Zoom"
+              end
+              return "Bind Mouse Wheel To Fine Zoom"
+          end },
+
         { "Vendors", "__s_vendor", "section", "vendor" },
 
         --[[ **The manual pair.** Automatic is an opinion applied to every
@@ -347,18 +390,31 @@ local M = OB.RegisterModule({
 
         { "Automatic Loot Rolls", "__s_autoroll", "section", "autoroll" },
 
-        --[[ The box types several at once; the list below reads them back one
-             per line and lets one be taken off. Two views of the same string,
-             because adding four names and removing the third are different
-             gestures and one control cannot be good at both. ]]--
-        { "Always Need These (Comma Separated)", "@account:autoNeed", "text",
-          200, 250 },
+        --[==[ **One name at a time in, one line at a time out.**
+
+             These were a single edit box holding the whole comma-separated
+             string, with the list underneath for taking entries off. The box
+             had a 250 character ceiling and Ollie reached it: past that the
+             list could not be edited at all, and well before it, finding the
+             right comma among thirty names is not editing, it is surgery.
+
+             Typing one name and pressing Enter has no ceiling, because the
+             stored string is never the thing being typed into. Adding and
+             removing are now the same shape -- one item, one gesture -- which
+             is what the two controls should always have been.
+
+             And neither is the usual way to fill these any more: right-click
+             the dice on a roll window. See `InstallRollButtons`. ]==]
+        { "Add To Need (Type A Name, Press Enter)", "__a_need", "text",
+          200, 60,
+          function(name) OB.modules.qol:AddAutoRollItem("need", name) end },
         { "Needing", "__l_need", "lines",
           function() return OB.modules.qol:AutoRollEntries("need") end, 96, nil,
           function(name) OB.modules.qol:RemoveAutoRollItem("need", name) end },
 
-        { "Always Greed These (Comma Separated)", "@account:autoGreed", "text",
-          200, 250 },
+        { "Add To Greed (Type A Name, Press Enter)", "__a_greed", "text",
+          200, 60,
+          function(name) OB.modules.qol:AddAutoRollItem("greed", name) end },
         { "Greeding", "__l_greed", "lines",
           function() return OB.modules.qol:AutoRollEntries("greed") end, 96, nil,
           function(name) OB.modules.qol:RemoveAutoRollItem("greed", name) end },
@@ -441,6 +497,203 @@ end
      by the client's default, and this module cannot tell those apart. Off means
      "stops changing it", not "puts it back to 180" -- guessing 180 would quietly
      undo a setting somebody made deliberately. ]]--
+--[==[ **Fine camera zoom**, from FineZoom 1.30 by Stormhand, MIT. See NOTICE.
+
+     1.12 exposes no zoom-speed CVar: the wheel moves the camera one fixed jump
+     and nothing in Lua can change that. What *can* be done is what upstream
+     did -- a binding of your own that calls `CameraZoomIn` with a number of your
+     choosing -- so the wheel is rebound onto it.
+
+     Ported rather than copied: the step lives in this addon's profile instead of
+     a global of its own, so it travels with a profile and appears on the panel
+     beside the other camera settings. The clamp and the default are upstream's,
+     and the reasons for both are good ones. ]==]
+local ZOOM_MIN_STEP = 0.05
+local ZOOM_MAX_STEP = 5.0
+
+function M:ZoomStep()
+    local step = tonumber(self:Config().zoomStep) or 0.2
+
+    if step < ZOOM_MIN_STEP then step = ZOOM_MIN_STEP end
+    if step > ZOOM_MAX_STEP then step = ZOOM_MAX_STEP end
+
+    return step
+end
+
+--[[ One function for both directions, because the only difference is which
+     client call is made and a second copy is a second place to fix. ]]--
+function M:FineZoom(out)
+    local step = self:ZoomStep()
+
+    if out then
+        if type(CameraZoomOut) == "function" then CameraZoomOut(step) end
+    else
+        if type(CameraZoomIn) == "function" then CameraZoomIn(step) end
+    end
+
+    return step
+end
+
+--[[ The names the client's own Key Bindings screen shows. Declared here rather
+     than in a Locales file because they belong to this feature, and the file
+     that owns the feature is the one somebody will look in. ]]--
+BINDING_HEADER_EQUADISOVERHAULCAMERA = "Equadis' Overhaul: Camera"
+BINDING_NAME_EQUADISOVERHAULZOOMIN = "Fine Zoom In"
+BINDING_NAME_EQUADISOVERHAULZOOMOUT = "Fine Zoom Out"
+
+local WHEEL_BINDINGS = {
+    { key = "MOUSEWHEELUP", action = "EQUADISOVERHAULZOOMIN" },
+    { key = "MOUSEWHEELDOWN", action = "EQUADISOVERHAULZOOMOUT" },
+}
+
+--[[ Whether the wheel is already on fine zoom, so the button can say so rather
+     than offering to do what has been done. ]]--
+function M:WheelIsFineZoom()
+    if type(GetBindingAction) ~= "function" then return false end
+
+    for i = 1, table.getn(WHEEL_BINDINGS) do
+        local pair = WHEEL_BINDINGS[i]
+        if GetBindingAction(pair.key) ~= pair.action then return false end
+    end
+
+    return true
+end
+
+--[==[ **Putting the wheel on fine zoom, and saving it.**
+
+     `SetBinding` alone lasts until the next reload, which is the half upstream's
+     `/fzbind` got right and plenty of addons get wrong -- somebody "fixes" their
+     bindings every session and never works out why they keep coming back.
+
+     The client's own set is written, so this is a change to somebody's key
+     bindings and it says so afterwards. ]==]
+function M:BindWheelToFineZoom()
+    if type(SetBinding) ~= "function" then return false end
+
+    local bound = 0
+
+    for i = 1, table.getn(WHEEL_BINDINGS) do
+        local pair = WHEEL_BINDINGS[i]
+        if SetBinding(pair.key, pair.action) then bound = bound + 1 end
+    end
+
+    if bound == 0 then return false end
+
+    if type(SaveBindings) == "function" then
+        local which = 1
+        if type(GetCurrentBindingSet) == "function" then
+            which = GetCurrentBindingSet()
+        end
+        SaveBindings(which)
+    end
+
+    Say("the mouse wheel now zooms by "
+            .. string.format("%.2f", self:ZoomStep())
+            .. " a notch. Key Bindings has it under Equadis' Overhaul: Camera.")
+
+    return true
+end
+
+--[==[ **FineZoom's two commands, kept, and the step they set is the slider.**
+
+     Ollie, 2026-10-26: *"port exactly over how finezoom works. copy commands,
+     but turn into sliders."* The two commands upstream has are `/finezoom <step>`
+     and `/fzbind`. The step already was the Fine Zoom Step slider, and the bind
+     already was the button beside it; what was missing is that somebody who
+     types the commands -- from a macro, a guide, or twenty years of habit --
+     got nothing.
+
+     So they exist again, and they are the same controls: `/finezoom 0.3` moves
+     the slider and the slider is what `/finezoom` reports, because there is one
+     number and it lives in the profile. Upstream's own details are kept: a comma
+     is a decimal point (`0,3`), the clamp is 0.05 to 5, and a word that is not a
+     number prints the usage line rather than doing anything.
+
+     One extra: while the standalone addon is still loaded its saved
+     `FineZoomStep` is written to as well, so the two never disagree about what
+     the step is. ]==]
+local function zoomNumber(text)
+    if type(text) ~= "string" or text == "" then return nil end
+
+    return tonumber((string.gsub(text, ",", ".")))
+end
+
+function M:SetZoomStep(value)
+    local step = tonumber(value)
+    if not step then return nil end
+
+    if step < ZOOM_MIN_STEP then step = ZOOM_MIN_STEP end
+    if step > ZOOM_MAX_STEP then step = ZOOM_MAX_STEP end
+
+    self:Config().zoomStep = step
+
+    if type(FineZoomStep) == "number" then FineZoomStep = step end
+    if OB.RefreshPanel then OB.RefreshPanel() end
+
+    return step
+end
+
+function M:FineZoomCommand(msg)
+    local step = zoomNumber(msg)
+
+    if not step then
+        Say("Usage: /finezoom <step>  (example: /finezoom 0.2). Now "
+                .. string.format("%.2f", self:ZoomStep()) .. ".")
+        return false
+    end
+
+    Say("zoom step set to " .. string.format("%.2f", self:SetZoomStep(step)))
+    return true
+end
+
+function M:FineZoomBindCommand()
+    if not self:BindWheelToFineZoom() then
+        Say("could not bind the mouse wheel.")
+        return false
+    end
+
+    return true
+end
+
+--[[ **Taken over from the standalone, never from anybody else.**
+
+     `SlashCmdList` is flat and a later write wins. FineZoom loads after this
+     addon, so a registration made at load time would be overwritten by its own
+     -- and then `/finezoom 2` would change a number the wheel does not read.
+     This runs at login, once everything is loaded, and writes under the same two
+     keys the standalone uses so the handler is replaced rather than competing
+     with it.
+
+     If the keys belong to something that is not FineZoom, they are left alone
+     and nothing is registered: the word is theirs. ]]--
+function OB.InstallFineZoomCommands()
+    local standalone = type(IsAddOnLoaded) == "function" and IsAddOnLoaded("FineZoom")
+    local installed = 0
+
+    local function install(key, word, handler)
+        if SlashCmdList[key] and not standalone then return end
+        if OB.SlashOwner and OB.SlashOwner(string.sub(word, 2), true) and not standalone then
+            return
+        end
+
+        setglobal("SLASH_" .. key .. "1", word)
+        SlashCmdList[key] = handler
+        installed = installed + 1
+    end
+
+    install("FINEZOOM", "/finezoom", function(msg)
+        local m = OB.modules and OB.modules.qol
+        if m then m:FineZoomCommand(msg) end
+    end)
+
+    install("FINEZOOMBIND", "/fzbind", function()
+        local m = OB.modules and OB.modules.qol
+        if m then m:FineZoomBindCommand() end
+    end)
+
+    return installed
+end
+
 function M:ApplyCamera()
     local cfg = self:Config()
 
@@ -1931,6 +2184,176 @@ function M:AddAutoRollItem(kind, text)
     return true
 end
 
+--[==[ **Right-click the dice to add what you are rolling on to a list.**
+
+     Ollie, 2026-11-08: *"auto loot rolls add ability to right click need/greed
+     then select add to list"*.
+
+     The lists were typed, by hand, into a box -- which means reading an item's
+     name off a roll window that is counting down and then spelling it
+     correctly somewhere else. The item is already in front of you and the
+     client already knows its name; the only thing missing was a way to say
+     "this one".
+
+     A menu rather than a bare right-click action, because the useful gesture is
+     often the *other* one: you are looking at the Need button, and what you
+     want is for this to always be a Greed. Both are offered from either button,
+     along with taking it off again.
+
+     `GroupLootFrame1RollButton` is Need and `...GreedButton` is Greed -- the
+     client's own names, out of `Interface\FrameXML\LootFrame.xml`, where the
+     Need button is `$parentRollButton` and nothing is called NeedButton. There
+     are four frames because `NUM_GROUP_LOOT_FRAMES` is four. ]==]
+local ROLL_BUTTONS = {
+    { suffix = "RollButton", kind = "need" },
+    { suffix = "GreedButton", kind = "greed" },
+}
+
+local NUM_ROLL_FRAMES = 4
+
+function M:RollMenuFrame()
+    if self.rollMenu then return self.rollMenu end
+    if type(CreateFrame) ~= "function" then return nil end
+
+    self.rollMenu = CreateFrame("Frame", "EquadisOverhaulRollMenu", UIParent,
+            "UIDropDownMenuTemplate")
+
+    return self.rollMenu
+end
+
+--[[ What the menu offers for one rolled item. Separated from the opening so a
+     test can read the entries without a dropdown on screen -- the same split
+     the waypoint menu uses. ]]--
+function M:RollMenuItems(name)
+    local out = {}
+    if not name or name == "" then return out end
+
+    local module = self
+
+    --[[ The item's name as the heading, because the menu opens at the cursor
+         with four roll windows stacked up and nothing else says which one this
+         belongs to. ]]--
+    table.insert(out, { text = name, isTitle = 1, notCheckable = 1 })
+
+    local onNeed = self:OnAutoRollList("need", name)
+    local onGreed = self:OnAutoRollList("greed", name)
+
+    table.insert(out, {
+        text = "Always Need this",
+        checked = onNeed and true or false,
+        func = function() module:AddAutoRollItem("need", name) end,
+    })
+
+    table.insert(out, {
+        text = "Always Greed this",
+        checked = onGreed and true or false,
+        func = function() module:AddAutoRollItem("greed", name) end,
+    })
+
+    --[[ Only when there is something to take off. An entry that does nothing is
+         an entry somebody clicks once and then distrusts. ]]--
+    if onNeed or onGreed then
+        table.insert(out, {
+            text = "Forget this item",
+            notCheckable = 1,
+            func = function()
+                module:RemoveAutoRollItem("need", name)
+                module:RemoveAutoRollItem("greed", name)
+            end,
+        })
+    end
+
+    return out
+end
+
+function M:ShowRollMenu(rollID, anchor)
+    if rollID == nil then return false end
+
+    local name = self:LootRollName(rollID)
+    if name == "" then return false end
+
+    local menu = self:RollMenuFrame()
+    if not menu then return false end
+    if type(UIDropDownMenu_Initialize) ~= "function" then return false end
+    if type(ToggleDropDownMenu) ~= "function" then return false end
+
+    local module = self
+
+    --[[ Captured now rather than read inside the closure: the dropdown is
+         re-initialised on every open, and by then another roll window may have
+         opened this same menu. Same reason the waypoint menu does it. ]]--
+    local forName = name
+
+    UIDropDownMenu_Initialize(menu, function()
+        local items = module:RollMenuItems(forName)
+
+        for i = 1, table.getn(items) do
+            UIDropDownMenu_AddButton(items[i])
+        end
+    end, "MENU")
+
+    ToggleDropDownMenu(1, nil, menu, anchor or "cursor", 0, 0)
+
+    return true
+end
+
+--[==[ **Hooked rather than replaced, and the left click is untouched.**
+
+     The client's own `OnClick` is `RollOnLoot(this:GetParent().rollID, 1)` and
+     that is the gesture everybody already knows. A right-click is free: 1.12
+     buttons answer only to the left unless told otherwise, so nothing is being
+     taken away from anybody.
+
+     Recognised through the wrapper itself rather than a boolean, for the reason
+     the tooltip's OnUpdate had to learn: this module's table is rebuilt on
+     every load and the frames are not, so a flag saying "hooked" outlives the
+     hook it describes and a reload would stack a second wrapper on the first. ]==]
+function M:InstallRollButtons()
+    if type(getglobal) ~= "function" then return 0 end
+
+    local hooked = 0
+
+    for i = 1, NUM_ROLL_FRAMES do
+        for b = 1, table.getn(ROLL_BUTTONS) do
+            local entry = ROLL_BUTTONS[b]
+            local button = getglobal("GroupLootFrame" .. i .. entry.suffix)
+
+            if button and button.SetScript
+                    and button:GetScript("OnClick") ~= button.ecoRollWrapper then
+                local previous = button:GetScript("OnClick")
+                local kind = entry.kind
+
+                if button.RegisterForClicks then
+                    button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+                end
+
+                local wrapper = function()
+                    if arg1 == "RightButton" then
+                        local m = EquadisClassicOverhaul.modules.qol
+                        local frame = this and this.GetParent and this:GetParent()
+
+                        if m then
+                            m:ShowRollMenu(frame and frame.rollID, this)
+                        end
+
+                        return
+                    end
+
+                    if previous then return previous() end
+                end
+
+                button.ecoRollWrapper = wrapper
+                button.ecoRollKind = kind
+                button:SetScript("OnClick", wrapper)
+
+                hooked = hooked + 1
+            end
+        end
+    end
+
+    return hooked
+end
+
 function M:LootRollName(rollID)
     local name
 
@@ -3312,6 +3735,20 @@ function M:ReadMacroIcon(slot)
 end
 
 function M:MacroIcon(slot)
+    --[==[ **A slot of nothing is not a slot.**
+
+         `GetActionTexture(nil)` is a real call: the client asks a button for
+         its icon through `button.action`, and that field is nil on a button
+         nothing has worked a slot out for yet -- which is every button between
+         being built and `ActionButton_UpdateAction` first running on it.
+
+         This went straight into `self.macroIcons[slot]`, and indexing a table
+         with nil is an error rather than a miss. One line of Lua, thrown from
+         inside a wrapper around one of the client's own functions, which is the
+         worst place for it: everything downstream of that call stops, and the
+         traceback names this addon for a button it does not own. ]==]
+    if slot == nil then return nil end
+
     self.macroIcons = self.macroIcons or {}
 
     local cached = self.macroIcons[slot]
@@ -3718,7 +4155,7 @@ function M:LinkQuality(link)
     local _, _, item = string.find(link, "|H(.+)|h")
     if not item then return nil end
 
-    local _, _, quality = GetItemInfo(item)
+    local _, _, quality = GetItemInfo(OB.ItemQuery(item))
     return quality
 end
 
@@ -3907,6 +4344,7 @@ function M:OnBind()
     self:InstallMapLabel()
     self:InstallConfirmSkip()
     self:InstallAutoRollCommands()
+    self:InstallRollButtons()
     self:InstallMacroIcons()
     self:HookMerchantUpdate()
     self:ApplyCamera()

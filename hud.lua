@@ -234,6 +234,38 @@ function OB.BindSlots()
                 end
             end
 
+            --[==[ **Marked as part of the stack, after the frame exists.**
+
+                 This ran *above* the block that creates `m.frame`, so on the
+                 first bind there was nothing to mark and the flag only landed
+                 on the second -- a border that went away when something
+                 unrelated happened to rebind.
+
+                 **Segments are deliberately not marked.** `OB.StyleSegments`
+                 styles each pip through `OB.StyleBar`, so flagging them
+                 suppressed the border on *every combo point* -- and a pip's
+                 border is not the stack's outer edge, it is what separates one
+                 pip from the next. The group border cannot do that job, so
+                 taking theirs away left five flat blocks, which is exactly what
+                 Ollie's screenshot shows.
+
+                 Cleared rather than merely not set: these frames outlive a
+                 rebind, and a pip flagged by the version that got this wrong
+                 would stay flagged for the session. ]==]
+            if m.frame then
+                if m.renders == "segments" then
+                    m.frame.eqInStack = nil
+
+                    for s = 1, (m.frame.count or 0) do
+                        if m.frame.bars[s] then
+                            m.frame.bars[s].eqInStack = nil
+                        end
+                    end
+                else
+                    m.frame.eqInStack = true
+                end
+            end
+
             OB.bound[slotId] = m
 
             if safeModuleCall(m, "OnBind", slot) then
@@ -517,6 +549,21 @@ coreHandlers.PLAYER_ENTERING_WORLD = function()
     --[[ Said here rather than at VARIABLES_LOADED: every addon has finished
          loading by now, so `IsAddOnLoaded` gives a complete answer. ]]--
     if OB.WarnConflicts then OB.WarnConflicts() end
+
+    --[[ And the other half of the same question: an addon that *was* here and
+         is not any more may have left keys pointing at nothing. Same moment,
+         for the same reason -- `IsAddOnLoaded` is only complete now. ]]--
+    if OB.InheritOrphanedBindings and not OB.bindingsInherited then
+        OB.bindingsInherited = true
+        OB.InheritOrphanedBindings()
+    end
+
+    --[[ FineZoom's `/finezoom` and `/fzbind`, once, now that the standalone (if
+         it is still switched on) has finished registering its own. ]]--
+    if OB.InstallFineZoomCommands and not OB.fineZoomCommands then
+        OB.fineZoomCommands = true
+        OB.InstallFineZoomCommands()
+    end
 
     --[[ And the walkthrough, for an account that has never seen it. Here for
          the same reason the conflict warning is: the world is drawn, so a

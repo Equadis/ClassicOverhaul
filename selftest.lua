@@ -239,10 +239,32 @@ section("bound modules", function(t)
     local state = "shown"
     if not OB.container:IsShown() then state = "hidden" end
 
+    --[==[ **Every condition that hides the HUD, including the one that was
+         missing.**
+
+         `OB.Toggle` hides on four things: the master switch, **hideDead**,
+         hideStealth and hideOOC. This printed three of them, and the one it
+         left out is the one that ships **on**. So a perfectly correct "hidden"
+         -- a player reading this while dead -- looked like a contradiction:
+         *HUD hidden, show=true, hideOOC=false*. Ollie's 2026-09-28 run said
+         that, and the state that would have explained it was the state not
+         being printed.
+
+         A diagnostic that leaves out a reason sends people looking for a bug
+         that is not there. ]==]
+    local dead = "?"
+    if type(UnitIsDeadOrGhost) == "function" then
+        local ok, value = pcall(UnitIsDeadOrGhost, "player")
+        if ok then dead = value and true or false end
+    end
+
     t:note("HUD " .. state
             .. "  show=" .. tostring(OB.profile.show)
             .. " hideOOC=" .. tostring(OB.profile.hideOOC)
             .. " combat=" .. tostring(OB.inCombat)
+            .. " hideDead=" .. tostring(OB.profile.hideDead)
+            .. " dead=" .. tostring(dead)
+            .. " hideStealth=" .. tostring(OB.profile.hideStealth)
             .. " stealth=" .. tostring(OB.inStealth))
 end)
 
@@ -258,13 +280,43 @@ section("font strings", function(t)
     local bad = 0
     local first
 
+    --[==[ **Named by something a fontless string actually has.**
+
+         This asked for the text and printed `?` when there was none -- and a
+         string with no font is very often one that has never been given any
+         text either, so the one case the report exists for is the one it could
+         not name. Ollie's 2026-09-28 run said exactly that: *3 of 348 font
+         strings have no font (first: ?)*, which is a failure nobody can act on.
+
+         Its own name, then its parent's, then where it sits in the registry.
+         The index is worth having on its own: registration order is creation
+         order, so it says which part of the interface was being built. ]==]
+    local function describe(fs, index)
+        local ok, text = pcall(fs.GetText, fs)
+        if ok and text and text ~= "" then return text end
+
+        if fs.GetName then
+            local named, name = pcall(fs.GetName, fs)
+            if named and name and name ~= "" then return name end
+        end
+
+        if fs.GetParent then
+            local hasParent, parent = pcall(fs.GetParent, fs)
+            if hasParent and parent and parent.GetName then
+                local named, name = pcall(parent.GetName, parent)
+                if named and name and name ~= "" then
+                    return "unnamed text on " .. name
+                end
+            end
+        end
+
+        return "registry entry " .. tostring(index)
+    end
+
     for i = 1, total do
         if not OB.texts[i]:GetFont() then
             bad = bad + 1
-            if not first then
-                local ok, text = pcall(OB.texts[i].GetText, OB.texts[i])
-                if ok and text and text ~= "" then first = text else first = "?" end
-            end
+            if not first then first = describe(OB.texts[i], i) end
         end
     end
 
@@ -274,7 +326,19 @@ section("font strings", function(t)
     -- a refactor that stops registering would otherwise pass by having nothing
     -- to check
     t:ok(total > 0, "the font string registry is empty")
-    t:note(total .. " registered, all fonted")
+
+    --[==[ **The note has to agree with the check above it.**
+
+         This said "all fonted" whatever the count was, so the failing run
+         printed `3 of 348 font strings have no font` and `348 registered, all
+         fonted` one line apart. A report that contradicts itself is worse than
+         one that says less, because the reader has to decide which half to
+         believe. ]==]
+    if bad == 0 then
+        t:note(total .. " registered, all fonted")
+    else
+        t:note(total .. " registered, " .. bad .. " with no font")
+    end
 end)
 
 -- ---------------------------------------------------------------------------
@@ -993,6 +1057,125 @@ function OB.RunThreatDebug(send)
             .. "|r" .. GREY .. " again. If |cff69ccf0seen a packet|r has turned"
             .. " true, the server answers while solo and the meter can." .. WHITE)
 end
+
+--[==[ **Why the tooltip shows the price it shows**, for whatever is under
+     the mouse right now.
+
+     The value block has six places it can come up empty -- the switch is
+     off, the module is not bound, the item could not be identified, no
+     provider knows it, the merchant frame is not being read, or the rows
+     were written and then collapsed -- and from the front all six look the
+     same: no price. Each is asked here by name, in the order the block asks
+     them, so the answer is one line rather than a session of guessing.
+
+     Read off the live `GameTooltip`, because the question is always about a
+     tooltip somebody is looking at. ]==]
+function OB.RunPriceDebug()
+    local m = OB.modules and OB.modules.tooltip
+
+    OB.Raw(GREY .. "Classic Overhaul price debug " .. WHITE .. OB.version)
+
+    if not m then
+        OB.Raw(RED .. "  the tooltip module is not loaded")
+        return
+    end
+
+    OB.Raw("  module enabled: " .. tostring(OB.ModuleEnabled("tooltip"))
+            .. "   show item values: " .. tostring(m:Config().showItemValues))
+
+    local db = EquadisClassicOverhaulVendorDB
+    OB.Raw("  vendor baseline: " .. (db and db.values
+            and (tostring(db.itemCount) .. " items") or "MISSING"))
+
+    local tip = GameTooltip
+
+    if not tip or not tip.IsShown or not tip:IsShown() then
+        OB.Raw(RED .. "  no tooltip is up -- hover an item and run this again")
+        return
+    end
+
+    local first = getglobal("GameTooltipTextLeft1")
+    OB.Raw("  hovering: " .. tostring(first and first:GetText()))
+
+    local itemId, suffixId, name = m:TooltipItemIdentity(tip)
+
+    if not itemId then
+        OB.Raw(RED .. "  the item could not be identified, so no price is"
+                .. " looked up at all")
+        OB.Raw(GREY .. "    (1.12 identifies by name through GetItemInfo;"
+                .. " an item the client has never cached has no id here)")
+        return
+    end
+
+    OB.Raw("  item: " .. tostring(itemId) .. ":" .. tostring(suffixId)
+            .. "  " .. tostring(name))
+
+    --[[ Each provider in turn, so a wrong answer can be blamed on the one
+         that gave it. ]]--
+    local market = OB.Market
+
+    if not market then
+        OB.Raw(RED .. "  the market service is not loaded")
+        return
+    end
+
+    local prices = market:GetPrices(itemId, suffixId or 0) or {}
+
+    OB.Raw("  market says: vendor " .. tostring(prices.vendor)
+            .. " (" .. tostring(prices.vendorSource) .. ")"
+            .. "   auction " .. tostring(prices.auction)
+            .. "   today " .. tostring(prices.today))
+
+    if db and db.values then
+        local row = db.values[itemId] or db.values[tonumber(itemId)]
+        OB.Raw("  baseline row for this item: " .. tostring(row))
+
+        --[[ The baseline is a vanilla table and this server has items it
+             never heard of, in whole blocks. Saying which is the difference
+             between "the price is broken" and "nobody has told me that
+             one". ]]--
+        if not row then
+            local near = 0
+            for id in pairs(db.values) do
+                if id >= itemId - 1000 and id <= itemId + 1000 then near = near + 1 end
+            end
+
+            OB.Raw(GREY .. "    no baseline price; " .. tostring(near)
+                    .. " items within 1000 ids of it are priced"
+                    .. (near == 0 and "  (this whole block is absent)" or ""))
+            OB.Raw(GREY .. "    ECO learns a price the first time you see the"
+                    .. " item at a merchant, and keeps it")
+        end
+    end
+
+    --[[ The merchant money frame, which is the only place 1.12 ever states a
+         vendor value and the highest authority when it is there. ]]--
+    local frame = m:TooltipMoneyFrame(tip)
+
+    OB.Raw("  money frame: " .. (frame and "found" or "none")
+            .. (frame and ("   shown " .. tostring(frame.IsShown and frame:IsShown())
+                    .. "   staticMoney " .. tostring(frame.staticMoney)) or ""))
+
+    OB.Raw("  merchant value read: "
+            .. tostring(m:TooltipMerchantValue(tip, itemId, suffixId, name)))
+
+    OB.Raw("  block active on this tooltip: " .. tostring(tip.eqEcoPriceActive))
+
+    for i = 1, (tip:NumLines() or 0) do
+        local left = getglobal("GameTooltipTextLeft" .. i)
+        local text = left and left:GetText()
+
+        if text and string.find(text, "Vendor", 1, true) then
+            OB.Raw("  the row it drew: " .. tostring(text)
+                    .. GREY .. "   height " .. tostring(left.GetHeight and left:GetHeight()))
+        end
+    end
+end
+
+OB.commands.pricedebug = {
+    help = "why the tooltip under your mouse shows the price it shows",
+    Run = function(args) OB.RunPriceDebug() end,
+}
 
 OB.commands.threatdebug = {
     help = "where threat could come from here, and whether it can work solo",

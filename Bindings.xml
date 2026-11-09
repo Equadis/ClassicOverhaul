@@ -1,4 +1,22 @@
 <Bindings>
+	<!-- Fine camera zoom, from FineZoom by Stormhand (MIT). 1.12 exposes no
+	     zoom-speed CVar, so a binding that calls CameraZoomIn with a number of
+	     your own is the only way to a finer step than the wheel's fixed jump.
+	     The step comes from the profile, through the module, so it follows the
+	     panel rather than a global of its own. -->
+	<Binding name="EQUADISOVERHAULZOOMIN" header="EQUADISOVERHAULCAMERA" runOnUp="true">
+		if EquadisClassicOverhaul and EquadisClassicOverhaul.modules
+				and EquadisClassicOverhaul.modules.qol then
+			EquadisClassicOverhaul.modules.qol:FineZoom(false)
+		end
+	</Binding>
+	<Binding name="EQUADISOVERHAULZOOMOUT" header="EQUADISOVERHAULCAMERA" runOnUp="true">
+		if EquadisClassicOverhaul and EquadisClassicOverhaul.modules
+				and EquadisClassicOverhaul.modules.qol then
+			EquadisClassicOverhaul.modules.qol:FineZoom(true)
+		end
+	</Binding>
+
 	<Binding name="AtlasCFM_TOGGLE" header="AtlasCFM_TITLE">
 		AtlasCFM = AtlasCFM or {}
 		AtlasCFM.ToggleAtlas()

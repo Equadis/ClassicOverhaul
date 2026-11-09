@@ -73,18 +73,30 @@ function OB.ApplyPositions()
     OB.container:SetWidth(1)
     OB.container:SetHeight(1)
 
-    --[[ Rescued before drawing, not only when moved.
+    --[==[ **Rescued before drawing, not only when moved.**
 
-         A profile carries positions across resolution changes, monitors and
-         scale settings, so a bar that was on screen when it was saved need not
-         be now. Clamping only on the write paths leaves that bar invisible with
-         no way back except a slider the user has to guess is the cause -- which
-         is the report this answers. Doing it here catches every route in,
-         including the one where nothing moved at all. ]]--
-    for id, slot in pairs(OB.profile.slots) do
-        slot.x = OB.ClampSlotCoord(id, "x", slot.x)
-        slot.y = OB.ClampSlotCoord(id, "y", slot.y)
-    end
+         A profile carries its position across resolution changes, monitors and
+         scale settings, so a group that was on screen when it was saved need not
+         be now. Clamping only on the write paths leaves it invisible with no way
+         back except a control the user has to guess is the cause -- which is the
+         report this answers. Doing it here catches every route in, including the
+         one where nothing moved at all.
+
+         **The group is clamped, not the bars.** Clamping each bar afterwards
+         would pull individual bars off the stack's line to satisfy a rule about
+         their own edges, which is exactly the overlapping, ragged layout the
+         stack exists to make impossible. ]==]
+    OB.profile.stackX = OB.ClampStackCoord("x", OB.profile.stackX or 0)
+    OB.profile.stackY = OB.ClampStackCoord("y", OB.profile.stackY or 0)
+
+    --[[ **The stack decides every x and y**, so it runs before anything reads
+         one, and after the clamp above. Looked up through `OB` rather than
+         called directly, because it is defined below this function. ]]--
+    OB.LayOutStack()
+
+    --[[ After the stack, because it is sized from what the stack just laid
+         out. ]]--
+    OB.ApplyStackBorder()
 
     for i = 1, table.getn(OB.barOrder) do
         local slotId = OB.barOrder[i]
@@ -142,6 +154,293 @@ OB.EdgesOf = edgesOf
 local function slotActive(slotId)
     if not OB.bound[slotId] then return false end
     return OB.profile.slots[slotId].show and true or false
+end
+
+--[==[ **The bars are one group, stacked, and they cannot overlap.**
+
+     Ollie, 2026-09-29: *"make group omnibars together. option to move then up
+     and down between each other. make it so they cant stack at all times.
+     moveable in edit mode. dont controll x and y. just height and width."*
+
+     Until now every bar carried its own `x` and `y` and could be dragged
+     anywhere, with a collision pass shoving them apart when they grew into one
+     another. That is two mechanisms doing one job, and it is why bars could
+     still end up overlapping: the collision pass only ran on the paths that
+     thought to call it.
+
+     A stack cannot overlap. There is nothing to prevent, because the position of
+     each bar is *computed* from the order and the heights of the bars above it.
+     `x` and `y` stop being settings and become **output** -- still written,
+     because the frames and the profile read them, but nothing outside this
+     function decides them.
+
+     **The trade-off, which the old code called out and was right about:** a
+     stack closes its gaps. A character with no off-hand bar has everything below
+     it move up, so two characters sharing a profile no longer line up pixel for
+     pixel. That was the argument for placing bars by hand; it loses to "they can
+     never overlap and I only set height and width".
+
+     One position for the whole group, and `stackY` is the **top edge** of the
+     first drawn bar rather than a centre. A stack grows downward from somewhere,
+     and that somewhere must not move when the top bar changes height. ]==]
+function OB.LayOutStack()
+    if not OB.profile then return 0 end
+
+    local slots = OB.profile.slots
+    local order = OB.BarStack()
+
+    --[==[ **Only the spacing that was asked for.**
+
+         This used to add `OB.BorderPad()` -- the room a border needs beside a
+         bar. There is no border beside a bar any more: one is drawn round the
+         whole column, outside it, so it takes no room between the rows. Leaving
+         the pad in would hold open a gap for art that is no longer there.
+
+         Halved because one gap sits between two bars rather than one on each. ]==]
+    local pad = (OB.profile.barGap or 0) / 2
+
+    local x = OB.profile.stackX or 0
+    local top = OB.profile.stackY or 0
+    local placed = 0
+
+    for i = 1, table.getn(order) do
+        local id = order[i]
+        local slot = slots[id]
+
+        --[[ A hidden or unusable bar takes no room. That is the point of a
+             stack: the gap closes rather than being held open by something
+             nobody can see. ]]--
+        if slot and slotActive(id) then
+            slot.x = x
+            slot.y = top - (slot.h / 2)
+
+            top = top - slot.h - (pad * 2)
+            placed = placed + 1
+        end
+    end
+
+    return placed
+end
+
+--[==[ **The order, as the profile holds it, with anything missing appended.**
+
+     A bar added by a later version is not in a saved list, and a saved list may
+     name a bar that no longer exists. Neither is a reason to draw nothing, so
+     the saved order is honoured as far as it goes and `OB.barOrder` supplies the
+     rest -- which also gives a profile that has never been touched exactly the
+     default layout. ]==]
+function OB.BarStack()
+    local saved = OB.profile and OB.profile.barStack
+    local order, seen = {}, {}
+
+    if type(saved) == "table" then
+        for i = 1, table.getn(saved) do
+            local id = saved[i]
+            if OB.profile.slots[id] and not seen[id] then
+                table.insert(order, id)
+                seen[id] = true
+            end
+        end
+    end
+
+    for i = 1, table.getn(OB.barOrder) do
+        local id = OB.barOrder[i]
+        if not seen[id] then
+            table.insert(order, id)
+            seen[id] = true
+        end
+    end
+
+    return order
+end
+
+--[==[ **Moving a bar up or down the stack**, which is the only ordering control
+     there is now that nothing has coordinates of its own.
+
+     It swaps with its neighbour in the **saved** order rather than the drawn
+     one, so a hidden bar keeps its place in the list and comes back where it was
+     rather than at the bottom. ]==]
+function OB.MoveBarInStack(slotId, delta)
+    if not OB.profile then return false end
+
+    local order = OB.BarStack()
+    local at = nil
+
+    for i = 1, table.getn(order) do
+        if order[i] == slotId then at = i break end
+    end
+
+    if not at then return false end
+
+    local to = at + (delta or 0)
+    if to < 1 or to > table.getn(order) then return false end
+
+    order[at], order[to] = order[to], order[at]
+    OB.profile.barStack = order
+
+    OB.ApplyPositions()
+    return true
+end
+
+--[==[ **How wide and how tall the drawn stack actually is.**
+
+     Needed to keep the group on screen. The old clamp asked each bar about its
+     own width and height, which is the right question for eight independent
+     rectangles and the wrong one for a column: what has to stay on screen is the
+     widest bar and the full height of everything drawn, not any single bar. ]==]
+function OB.StackExtent()
+    if not OB.profile then return 0, 0 end
+
+    local slots = OB.profile.slots
+    local order = OB.BarStack()
+    local pad = (OB.profile.barGap or 0) / 2
+
+    local widest, total, drawn = 0, 0, 0
+
+    for i = 1, table.getn(order) do
+        local slot = slots[order[i]]
+
+        if slot and slotActive(order[i]) then
+            if (slot.w or 0) > widest then widest = slot.w or 0 end
+            total = total + (slot.h or 0) + (pad * 2)
+            drawn = drawn + 1
+        end
+    end
+
+    --[[ The gap below the last bar is not part of the column. ]]--
+    if drawn > 0 then total = total - (pad * 2) end
+
+    return widest, total
+end
+
+--[==[ **The group's own clamp.**
+
+     `stackX` is a centre, so it clamps like anything else centred: half the
+     screen less half the widest bar.
+
+     `stackY` is **not** a centre -- it is the top edge, and the column hangs
+     below it. So the two bounds are not symmetrical: the top edge cannot go
+     above the top of the screen, and the *bottom* of the column cannot go below
+     the bottom of it. Treating this as a centre put a tall stack half off screen
+     with the controls saying it was within range. ]==]
+function OB.ClampStackCoord(axis, v)
+    v = OB.ClampCoord(v)
+    if not OB.profile then return v end
+
+    local widest, total = OB.StackExtent()
+    local scale = OB.ContainerScale()
+
+    if axis == "x" then
+        local limit = OB.ScreenLimit("x", widest, scale)
+        if v > limit then return limit end
+        if v < -limit then return -limit end
+        return v
+    end
+
+    local span = GetScreenHeight()
+    if not span or span <= 0 then return v end
+    if not scale or scale <= 0 then scale = 1 end
+
+    local half = (span / 2) / scale
+
+    if v > half then v = half end
+    if (v - total) < -half then v = total - half end
+
+    --[[ A stack taller than the screen cannot satisfy both bounds. The top wins:
+         a column running off the bottom is readable from the top down, one
+         running off the top has lost the bar people look at first. ]]--
+    if v > half then v = half end
+
+    return v
+end
+
+--[==[ **One border, round the whole column.**
+
+     Ollie, 2026-09-29: *"omni bars bar border would be around the entire unit,
+     not per bar"*. Eight stacked rectangles each in their own frame read as
+     eight widgets that happen to be touching, and the horizontal rules between
+     them end up the heaviest lines on the cluster. One group is one thing, so
+     it gets one edge.
+
+     Hung **outside** the column, so it costs nothing between the rows -- which
+     is why `LayOutStack` no longer reserves border room per bar.
+
+     Sized on every pass rather than once: the column's height changes whenever
+     a bar is resized, hidden, shown or reordered, and a border that remembers
+     the size it was built at is a rectangle round where the bars used to be. ]==]
+function OB.StackBorderFrame()
+    if OB.stackBorder then return OB.stackBorder end
+    if type(CreateFrame) ~= "function" then return nil end
+
+    local f = CreateFrame("Frame", "EquadisClassicOverhaulStackBorder",
+            OB.container)
+
+    --[[ Above the bars, like a bar's own border frame was, so a Standard edge
+         is not cut in half by the fill it surrounds. ]]--
+    f:SetFrameLevel(OB.container:GetFrameLevel() + 6)
+    f:Hide()
+
+    OB.stackBorder = f
+    return f
+end
+
+function OB.ApplyStackBorder()
+    local f = OB.StackBorderFrame()
+    if not f or not OB.profile then return false end
+
+    local widest, total = OB.StackExtent()
+
+    --[[ Nothing drawn is nothing to surround. ]]--
+    if widest <= 0 or total <= 0 then
+        f:SetBackdrop(nil)
+        f:Hide()
+        return false
+    end
+
+    local pad = OB.BorderPad()
+    local edge = OB.BorderEdge(OB.Look().border, widest + (pad * 2),
+            total + (pad * 2))
+
+    if pad <= 0 or not edge then
+        f:SetBackdrop(nil)
+        f:Hide()
+        return false
+    end
+
+    --[[ Hung by the ink rather than by the reserved room, the same rule a bar's
+         own border followed -- `OB.BorderEdge` has just scaled the art for this
+         rectangle, and its `outset` is how far the line actually reaches. ]]--
+    local hang = math.floor(tonumber(edge.outset)
+            or ((tonumber(edge.edgeSize) or 8) / 2))
+    if hang < 1 then hang = 1 end
+
+    f:SetWidth(widest + (hang * 2))
+    f:SetHeight(total + (hang * 2))
+
+    --[[ `stackY` is the top edge and the column hangs below it, so the centre
+         is half the column's height down from there. ]]--
+    f:ClearAllPoints()
+    f:SetPoint("CENTER", OB.container, "CENTER",
+            OB.profile.stackX or 0,
+            (OB.profile.stackY or 0) - (total / 2))
+
+    f:SetBackdrop(edge)
+    f:SetBackdropBorderColor(1, 1, 1, 1)
+    f:Show()
+
+    return true
+end
+
+--[[ Where a bar sits in the stack, for a control that greys itself out at the
+     ends rather than offering a move that does nothing. ]]--
+function OB.BarStackIndex(slotId)
+    local order = OB.BarStack()
+
+    for i = 1, table.getn(order) do
+        if order[i] == slotId then return i, table.getn(order) end
+    end
+
+    return nil, table.getn(order)
 end
 
 --[[ True when placing `slotId` at (x, y) would overlap another drawn slot.
@@ -296,59 +595,43 @@ function OB.ShrinkJoinedStep(sizes, from, dx, dy)
     return dx, dy
 end
 
---[[ Move a slot by a whole-pixel offset, honouring Join.
+--[==[ **Movement moves the group, because there is only one position.**
 
-     This is the single movement code path: the X/Y sliders, the arrow buttons
-     and dragging all end up here. ]]--
+     This is still the single movement code path -- the arrow buttons, the drag
+     and anything else all end up here -- but there is nothing per-bar left to
+     move. A bar's place in the stack is decided by the order and by the heights
+     above it, so the only thing a drag can change is where the whole group sits.
+
+     `slotId` is accepted and ignored. Every caller passes one because every
+     caller used to need one, and a signature change would be a second, unrelated
+     edit across a dozen call sites for no behaviour.
+
+     **No collision check.** A stack cannot overlap, so there is no step to
+     refuse -- which also removes the case where a bar became stuck because the
+     only way out was through a neighbour. `join` is likewise gone: the group
+     always moves together, which is what Join was asking for. ]==]
 function OB.NudgeSlot(slotId, dx, dy)
     if not OB.profile then return end
-    local slots = OB.profile.slots
-    if not slots[slotId] then return end
 
-    if not OB.profile.join then
-        local nx = OB.ClampSlotCoord(slotId, "x", slots[slotId].x + dx)
-        local ny = OB.ClampSlotCoord(slotId, "y", slots[slotId].y + dy)
-
-        --[[ Refuse a step that would create an overlap. A slot that already
-             overlaps may always move, so it can escape. Joined moves keep
-             relative positions and can never create one, hence only this
-             branch checks. ]]--
-        if OB.SlotCollides(slotId, nx, ny)
-                and not OB.SlotCollides(slotId, slots[slotId].x, slots[slotId].y) then
-            OB.RefreshPanel()
-            return
-        end
-
-        slots[slotId].x = nx
-        slots[slotId].y = ny
-    else
-        -- shrink the shared step so no slot leaves the allowed range, which
-        -- keeps the relative spacing intact
-        dx, dy = OB.ShrinkJoinedStep(slots, slots, dx, dy)
-
-        for id, el in pairs(slots) do
-            el.x = el.x + dx
-            el.y = el.y + dy
-        end
-    end
+    OB.profile.stackX = OB.ClampStackCoord("x", (OB.profile.stackX or 0) + (dx or 0))
+    OB.profile.stackY = OB.ClampStackCoord("y", (OB.profile.stackY or 0) + (dy or 0))
 
     OB.ApplyPositions()
     OB.RefreshPanel()
 end
 
--- set an absolute coordinate through the nudge path, so Join still applies
+--[[ Set the group's position on one axis, through the nudge path so there is
+     still one place that moves anything. Kept because the import path and the
+     slash command both set a coordinate outright rather than stepping. ]]--
 function OB.SetSlotCoord(slotId, axis, value)
-    local slot = OB.profile.slots[slotId]
-    if not slot then return end
+    if not OB.profile then return end
 
-    value = OB.ClampSlotCoord(slotId, axis, floor(value + 0.5))
+    value = OB.ClampStackCoord(axis, floor(value + 0.5))
 
     if axis == "x" then
-        local delta = value - slot.x
-        if delta ~= 0 then OB.NudgeSlot(slotId, delta, 0) end
+        OB.NudgeSlot(slotId, value - (OB.profile.stackX or 0), 0)
     else
-        local delta = value - slot.y
-        if delta ~= 0 then OB.NudgeSlot(slotId, 0, delta) end
+        OB.NudgeSlot(slotId, 0, value - (OB.profile.stackY or 0))
     end
 end
 
@@ -375,11 +658,18 @@ function OB.StartDrag(frame)
     drag.active = true
     drag.slot = slotId
     drag.cursorX, drag.cursorY = GetCursorPosition()
-    drag.start = {}
 
-    for id, el in pairs(OB.profile.slots) do
-        drag.start[id] = { x = el.x, y = el.y }
-    end
+    --[==[ **The group's position, not each bar's.**
+
+         This snapshotted all eight bars because all eight had coordinates. They
+         do not any more -- the stack computes them -- so what has to be
+         remembered is the one position a drag can change.
+
+         Snapshotted rather than stepped, for the reason this file's header
+         gives: positions are computed from where the drag *started* plus the
+         total cursor delta, so rounding cannot accumulate over a long drag. ]==]
+    drag.startX = OB.profile.stackX or 0
+    drag.startY = OB.profile.stackY or 0
 end
 
 function OB.StopDrag()
@@ -731,6 +1021,22 @@ function OB.AttachCameraDrag(frame)
     return true
 end
 
+--[==[ **Dragging moves the group.**
+
+     Reported by Ollie the day the stack shipped: *"omnibars dont move in
+     editmode"*. This wrote each bar's own `x` and `y` and then called
+     `ApplyPositions` -- which now lays the stack out and **overwrites exactly
+     those two fields** from the group's position. Every drag was applied and
+     immediately undone within one call, so the bars sat perfectly still while
+     the cursor moved.
+
+     Nothing caught it because nothing drove a drag: the suite exercised
+     `NudgeSlot`, which was rewired with the rest, and the mouse path was left
+     as the one caller still writing per-bar coordinates.
+
+     The collision branch goes with it. It existed to slide a bar along its free
+     axis when the full move would overlap a neighbour, and a stack has no
+     neighbours to overlap. ]==]
 function OB.UpdateDrag()
     if not drag.active then return end
 
@@ -739,36 +1045,8 @@ function OB.UpdateDrag()
     local dx = floor((cx - drag.cursorX) / scale + 0.5)
     local dy = floor((cy - drag.cursorY) / scale + 0.5)
 
-    local slots = OB.profile.slots
-
-    if not OB.profile.join then
-        local id = drag.slot
-        local nx = OB.ClampSlotCoord(id, "x", drag.start[id].x + dx)
-        local ny = OB.ClampSlotCoord(id, "y", drag.start[id].y + dy)
-
-        -- slide along the free axis when the full move would collide; a slot
-        -- that already collides drags freely so it can escape
-        if OB.SlotCollides(id, nx, ny)
-                and not OB.SlotCollides(id, slots[id].x, slots[id].y) then
-            if not OB.SlotCollides(id, nx, slots[id].y) then
-                ny = slots[id].y
-            elseif not OB.SlotCollides(id, slots[id].x, ny) then
-                nx = slots[id].x
-            else
-                nx, ny = slots[id].x, slots[id].y
-            end
-        end
-
-        slots[id].x = nx
-        slots[id].y = ny
-    else
-        dx, dy = OB.ShrinkJoinedStep(slots, drag.start, dx, dy)
-
-        for id, el in pairs(slots) do
-            el.x = drag.start[id].x + dx
-            el.y = drag.start[id].y + dy
-        end
-    end
+    OB.profile.stackX = OB.ClampStackCoord("x", (drag.startX or 0) + dx)
+    OB.profile.stackY = OB.ClampStackCoord("y", (drag.startY or 0) + dy)
 
     OB.ApplyPositions()
 end

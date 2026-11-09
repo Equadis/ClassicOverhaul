@@ -2372,7 +2372,7 @@ local CM_LINK = "%[([^%[^%]]-)%]{(%d+):(%d+):(%d+):(%d+)}(\b*)"
      cannot colour is better than an item you cannot click. ]]--
 local function decodeCM(name, a, b, c, d, marks)
     local itemString = "item:" .. a .. ":" .. b .. ":" .. c .. ":" .. d
-    local itemName, itemLink, rarity = GetItemInfo(itemString)
+    local itemName, itemLink, rarity = GetItemInfo(OB.ItemQuery(itemString))
 
     if itemName and itemLink and rarity then
         return (qualityColor[tonumber(rarity)] or "")
@@ -2391,7 +2391,7 @@ end
 
 local function encodeCM(color, a, b, c, d, name)
     local itemString = "item:" .. a .. ":" .. b .. ":" .. c .. ":" .. d
-    local _, _, rarity = GetItemInfo(itemString)
+    local _, _, rarity = GetItemInfo(OB.ItemQuery(itemString))
 
     --[[ Not in the cache, so the colour it arrived with is the only evidence of
          what quality it is. ]]--

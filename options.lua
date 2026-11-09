@@ -195,9 +195,11 @@ function OB.ApplyOption(w, value)
     local t = container(w)
     if not t then return end
 
-    --[[ Position is the one setting that cannot be written directly: it has to
-         go through the nudge path, or Join and collision are bypassed and the
-         sliders become a second, disagreeing way to move a bar. ]]--
+    --[==[ Position still cannot be written directly. It is no longer a per-bar
+         setting at all -- the bars are a stack -- but the slash prompt can still
+         name `x` or `y`, and the honest answer is to move the **group**, which
+         is what `SetSlotCoord` does now. Writing the key onto a slot would be
+         writing a value the next layout pass overwrites. ]==]
     if w.scope == "slot" and (w.key == "x" or w.key == "y") then
         OB.SetSlotCoord(OB.panel.bar, w.key, value)
         return
@@ -205,13 +207,15 @@ function OB.ApplyOption(w, value)
 
     OB.Set(t, w.key, value)
 
-    --[[ Growing a bar can push it into the one below, and Allow Bar Overlap
-         being off is the user saying that must not happen. Position already goes
-         through the collision path above; size has to be resolved after the
-         fact, because a bar has to be allowed to grow -- it is the *other* bars
-         that move. ]]--
+    --[==[ **A taller bar moves the ones below it, and that is all it does.**
+
+         This used to call `OB.ResolveOverlap`, which hunted for bars that had
+         grown into each other and shoved them apart. A stack has no such state:
+         every bar below is placed from the heights above it, so re-laying the
+         stack *is* the resolution -- and unlike the old pass it cannot be
+         reached by a path that forgot to call it. ]==]
     if w.scope == "slot" and (w.key == "w" or w.key == "h") then
-        OB.ResolveOverlap()
+        OB.ApplyPositions()
     end
 
     if w.scope == "global" and OB.onChange[w.key] then OB.onChange[w.key]() end
@@ -832,12 +836,45 @@ local function addInput(page, w)
         OB.ApplyOption(box.w, box:GetText() or "")
     end
 
+    --[==[ **An adding box empties itself and never writes on the way out.**
+
+         Ollie, 2026-11-08: *"enter the name then click enter to add to list. we
+         reach a ch limit and its hard to do"*.
+
+         Holding a whole comma-separated list in one edit box has a ceiling --
+         `SetMaxLetters` -- and past it the list cannot be edited at all, which
+         is where he was. Typing one name and pressing Enter has no ceiling,
+         because the stored string is never the thing being typed into.
+
+         **Only Enter commits.** The field version writes on focus loss too,
+         which is right for a value being edited and wrong for this: clicking
+         away from a half-typed name would add the half. ]==]
+    local function add()
+        if box.syncing then return end
+
+        local text = box:GetText() or ""
+        box:SetText("")
+
+        if text == "" then return end
+
+        box.w.append(text)
+    end
+
     box:SetScript("OnEnterPressed", function()
+        if box.w and box.w.append then
+            add()
+            this:ClearFocus()
+            return
+        end
+
         commit()
         this:ClearFocus()
     end)
 
-    box:SetScript("OnEditFocusLost", function() commit() end)
+    box:SetScript("OnEditFocusLost", function()
+        if box.w and box.w.append then return end
+        commit()
+    end)
 
     box:SetScript("OnEscapePressed", function()
         this:ClearFocus()
@@ -846,7 +883,15 @@ local function addInput(page, w)
 
     box.Update = function(self)
         self.syncing = true
-        self:SetText(tostring(readValue(self.w) or ""))
+
+        --[[ An adding box has nothing to show: what it would display is the
+             list, and the list is drawn underneath it a row at a time. ]]--
+        if self.w and self.w.append then
+            self:SetText("")
+        else
+            self:SetText(tostring(readValue(self.w) or ""))
+        end
+
         self.syncing = false
     end
 
@@ -918,6 +963,14 @@ local function describeRow(opt, scope, moduleId)
              presets can cover. opt[4] is the box width, opt[5] its limit. ]]--
         w.kind = "text"
         w.width, w.maxLetters = opt[4], opt[5]
+
+        --[==[ **A box that adds to a list rather than holding one.**
+
+             `opt[6]` is a function taking the typed text. With it, the box is
+             an input rather than a field: it starts empty, Enter hands what was
+             typed over and clears it, and nothing is stored under the row's own
+             key. See `addInput`. ]==]
+        w.append = opt[6]
     elseif kind == "header" then
         w.kind = "header"
     elseif kind == "action" then
@@ -1679,8 +1732,36 @@ local slotGeometry = {
     { "Flip Fill", "flip", "boolean", nil, nil, nil, nil, nil, UNUSABLE },
     { "Width", "w", "slider", 0, 400, 1, nil, nil, UNUSABLE },
     { "Height", "h", "slider", 1, 40, 1, nil, nil, UNUSABLE },
-    { "X Position", "x", "slider", -2000, 2000, 1, nil, nil, UNUSABLE },
-    { "Y Position", "y", "slider", -2000, 2000, 1, nil, nil, UNUSABLE },
+
+    --[==[ **Where a bar sits is its place in the stack, not a coordinate.**
+
+         X and Y sliders lived here. They are gone because there is nothing for
+         them to write: the bars are one group with one position, and each bar's
+         place is computed from the order and the heights above it. Two sliders
+         per bar offering to move something that cannot move independently is a
+         control that lies about what it does.
+
+         What replaces them is the only ordering there is. The group itself is
+         moved by dragging it in Edit Mode.
+
+         The label says which way it goes and stops at the ends -- a button that
+         is still there at the top of the stack and does nothing when pressed is
+         worse than one that says so. ]==]
+    { "Move Up", "__bar_up", "action",
+      function() OB.MoveBarInStack(OB.panel and OB.panel.bar, -1) end,
+      function()
+          local at = OB.BarStackIndex(OB.panel and OB.panel.bar)
+          if at and at <= 1 then return "Move Up (at the top)" end
+          return "Move Up"
+      end },
+
+    { "Move Down", "__bar_down", "action",
+      function() OB.MoveBarInStack(OB.panel and OB.panel.bar, 1) end,
+      function()
+          local at, total = OB.BarStackIndex(OB.panel and OB.panel.bar)
+          if at and total and at >= total then return "Move Down (at the bottom)" end
+          return "Move Down"
+      end },
     { "Text Size", "textSize", "slider", 6, 40, 1, nil, nil, UNUSABLE },
     { "Background Color", "bg", "color", true, nil, nil, nil, nil, UNUSABLE },
 }

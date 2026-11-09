@@ -258,7 +258,7 @@ end
      automatically for a rogue would move a hunter's bars. Restack Occupied Bars
      does it on demand -- see constraint 15. ]]--
 OB.defaults = {
-    schema = 44,
+    schema = 45,
 
     -- visibility
     show = true,
@@ -364,6 +364,23 @@ OB.defaults = {
         extras    = { x = 0, y = 4,   w = 200, h = 8,  show = true,  flip = false,
                       bg = { 0, 0, 0, 0.5 }, textSize = 12 },
     },
+
+    --[==[ **The bar stack: one group, one position, an explicit order.**
+
+         The bars are placed relative to each other rather than individually, so
+         they cannot overlap -- see `OB.LayOutStack`. Each slot's `x` and `y` are
+         still in the profile because the frames read them, but they are written
+         by the layout pass rather than chosen by anybody.
+
+         `stackY` is the **top edge** of the first drawn bar, not a centre: a
+         stack grows downward from a point, and that point must not move when the
+         top bar changes height. 115 is where the shipped health bar's top edge
+         sits (centre 107, height 16), so a fresh profile looks exactly as it
+         always did. ]==]
+    barStack = { "health", "resource", "mainhand", "offhand",
+                 "ranged", "distance", "secondary", "extras" },
+    stackX = 0,
+    stackY = 115,
 
     -- filled in by OB.RegisterModule as each module loads
     modules = {},
@@ -1586,7 +1603,71 @@ OB.profileMigrations = {
         local c = p.modules and p.modules.characterpanel
         if c and c.statFontSize == 9 then c.statFontSize = 8 end
     end },
+
+    --[==[ **The bars become one stack, seeded from where they already are.**
+
+         Bars used to carry their own `x` and `y`. They are now placed relative
+         to each other, which means the profile needs an **order** and the group
+         needs a **position** -- and inventing either would move somebody's
+         layout out from under them on upgrade.
+
+         Both are read off what they already had: the order is top to bottom by
+         the `y` they were last drawn at, and the group's position is the top
+         edge of whatever was highest. A profile that has never been touched
+         therefore lands exactly on the shipped defaults, and one that was
+         arranged by hand keeps its arrangement.
+
+         **Hidden bars keep their place in the order.** They take no room on
+         screen, but a bar switched off and on again should come back where it
+         was rather than at the bottom, so every slot is listed. ]==]
+    { 45, function(p) OB.SeedStackFromSlots(p) end },
 }
+
+--[==[ **Turn a set of hand-placed bars into a stack, without moving them.**
+
+     Bars used to carry their own `x` and `y`. They are placed relative to each
+     other now, which means the profile needs an **order** and the group needs a
+     **position** -- and inventing either would move somebody's layout out from
+     under them.
+
+     Both are read off what they already had: the order is top to bottom by the
+     `y` they were last drawn at, and the group's position is the top edge of
+     whatever was highest. A profile that has never been touched therefore lands
+     exactly on the shipped defaults.
+
+     Two callers, which is why it is a function: the schema 45 migration, and the
+     RogueBars import -- which brings in eight hand-placed rectangles and would
+     otherwise have them silently reordered by the default list.
+
+     **Hidden bars keep their place.** They take no room on screen, but a bar
+     switched off and on again should come back where it was rather than at the
+     bottom, so every slot is listed. ]==]
+function OB.SeedStackFromSlots(p)
+    if type(p) ~= "table" or type(p.slots) ~= "table" then return false end
+
+    local order = {}
+    for id in pairs(p.slots) do table.insert(order, id) end
+
+    --[[ Ties broken by name, so the result does not depend on the order `pairs`
+         happened to walk the table in -- otherwise the same profile seeds two
+         different ways on two runs. ]]--
+    table.sort(order, function(a, b)
+        local ya = tonumber(p.slots[a].y) or 0
+        local yb = tonumber(p.slots[b].y) or 0
+        if ya == yb then return a < b end
+        return ya > yb
+    end)
+
+    if table.getn(order) == 0 then return false end
+
+    p.barStack = order
+
+    local first = p.slots[order[1]]
+    p.stackX = tonumber(first.x) or 0
+    p.stackY = (tonumber(first.y) or 0) + ((tonumber(first.h) or 0) / 2)
+
+    return true
+end
 
 function OB.RunProfileMigrations(p)
     p.schema = p.schema or 1
@@ -1717,6 +1798,12 @@ function OB.ImportRogueBars(p)
                 copyColor(e.Energy.TickerColor, p.modules.power.tickerColor)
         if e.Energy.TextMode then p.modules.power.textMode = e.Energy.TextMode end
     end
+
+    --[[ **Last, once every bar has its imported geometry.** RogueBars places its
+         eight rectangles by hand; this reads that arrangement back out as an
+         order and a group position, so an import lands where the user had it
+         rather than in this addon's default order. ]]--
+    OB.SeedStackFromSlots(p)
 
     return true
 end
@@ -1922,6 +2009,43 @@ function OB.RunDBMigrations(db)
                 if uf.compact == nil then
                     uf.compact = OB.CVar("ufCompactMode") == "1"
                 end
+            end
+        end
+    end
+
+    --[==[ **The standalone FineZoom's step, copied across once.**
+
+         Ollie, 2026-10-26: *"copy finezoom settings over"*. His tuned step sat
+         in `FineZoomStep` -- 2 on one account, a fifth of a notch on the other --
+         while this addon's slider said 0.2 everywhere, so the wheel zoomed by a
+         different amount the day he followed the conflict warning and switched
+         FineZoom off.
+
+         A switched-off addon's saved variables are not loaded at all, so the
+         only moment the number can be read is a session with FineZoom still on.
+         Hence the flag is set **only when a number was actually there**: a
+         character with FineZoom disabled changes nothing and leaves the import
+         for the next login that has it, and the store is account-wide, so one
+         such login carries every profile.
+
+         Only a profile still on the shipped 0.2 is moved -- that is "has not
+         been told yet", which is all an import is for; a step somebody set here
+         afterwards is theirs. Clamped to upstream's own 0.05 to 5, so a
+         hand-edited saved variable cannot hand the client a number it should
+         never see. A profile with no camera settings at all is left alone: it
+         has nothing to be told yet, and the default is what it will get. ]==]
+    if not db.migrated.fineZoomStep and type(FineZoomStep) == "number" then
+        db.migrated.fineZoomStep = true
+
+        local step = FineZoomStep
+        if step < 0.05 then step = 0.05 end
+        if step > 5 then step = 5 end
+
+        for _, profile in pairs(db.profiles or {}) do
+            local camera = profile.modules and profile.modules.qol
+
+            if camera and (camera.zoomStep == nil or camera.zoomStep == 0.2) then
+                camera.zoomStep = step
             end
         end
     end
@@ -2173,14 +2297,39 @@ function OB.LoadConfig()
     local p = OB.DeepCopy(OB.defaults)
 
     local existing = db.profiles[name]
+
     if existing then
         OB.DeepMerge(p, existing)
-    elseif db.pendingRogueBarsImport then
-        db.pendingRogueBarsImport = nil
-        if OB.ImportRogueBars(p) then
-            Say("imported your RogueBars layout into the '" .. name .. "' profile.")
+    else
+        --[==[ **A profile that does not exist yet starts from the shipped
+             layout**, not from the bare defaults.
+
+             Ollie, 2026-10-01: *"take the current layout, and set it as
+             default"*. `starterprofile.lua` is that layout, captured from his
+             own interface and holding only the places it departs from what the
+             modules declare -- so a default that is changed in its module still
+             takes effect, and a setting nobody has an opinion about stays
+             wherever its own file put it.
+
+             **This one branch is every way a profile is born.** A fresh
+             install, a new character, `/eq reset` and `/eq resetall` all delete
+             or never write the saved profile and come through here, so "the
+             default" means the same thing in all four rather than three. ]==]
+        if OB.starterProfile then OB.DeepMerge(p, OB.starterProfile) end
+
+        --[[ After the starter layout, because an import is about *this*
+             player's old addon and the starter is about nobody in particular.
+             Where they disagree about where a bar goes, the one that was
+             measured off their own interface wins. ]]--
+        if db.pendingRogueBarsImport then
+            db.pendingRogueBarsImport = nil
+            if OB.ImportRogueBars(p) then
+                Say("imported your RogueBars layout into the '" .. name
+                        .. "' profile.")
+            end
         end
     end
+
     db.pendingRogueBarsImport = nil
 
     OB.RunProfileMigrations(p)

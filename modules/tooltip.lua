@@ -365,8 +365,28 @@ local function priceValueText(text)
     -- the colon. Keeping a leading |r is harmless but ugly when we supply our
     -- own label, so consume it here.
     value = string.gsub(value, "^|r%s*", "")
+
+    --[==[ **A placeholder is not a value.**
+
+         These rows are kept so that another addon's *formatted* figure --
+         Aux's "Today" with its percentage, say -- survives being rewritten.
+         What came back on an item nobody has priced was `?`, which then sat
+         in ECO's own Vendor row for the rest of the session and read as a
+         price that had gone wrong rather than one that was never known.
+         Stripped of colour codes, anything with no digit in it is a
+         placeholder and is dropped, so the row says Unknown and means
+         it. ]==]
+    local bare = string.gsub(value, "|c%x%x%x%x%x%x%x%x", "")
+    bare = string.gsub(bare, "|r", "")
+
+    if not string.find(bare, "%d") then return nil end
+
     return value
 end
+
+--[[ The placeholder rule above, reachable from the suite: it is a decision
+     about somebody else's text and the whole of a report. ]]--
+function M:PriceValueTextForTest(text) return priceValueText(text) end
 
 local function clamp01(value)
     value = tonumber(value) or 0
@@ -638,10 +658,7 @@ function M:StyleMovePreview()
     OB.ApplyFont(f.level, look.fontSize or 12, "tooltip")
     OB.ApplyFont(f.target, look.fontSize or 12, "tooltip")
 
-    local fontIndex = tonumber(cfg.barFont) or tonumber(cfg.font) or (OB.fontIndex["Roboto"] or 1)
-    local fontPath = OB.fontPaths[fontIndex] or STANDARD_TEXT_FONT
-    local size = tonumber(cfg.barFontSize) or tonumber(cfg.fontSize) or 12
-    local flags = OB.FontFlags(cfg.fontOutline)
+    local fontPath, size, flags = self:BarFontSpec()
     if f.healthText and f.healthText.SetFont then
         f.healthText:SetFont(fontPath, size, flags)
         if not f.healthText:GetFont() then f.healthText:SetFont(STANDARD_TEXT_FONT, size, flags) end
@@ -1448,10 +1465,7 @@ end
 function M:StyleBarFont(bar)
     if not bar then return end
     local cfg = self:Config()
-    local fontIndex = tonumber(cfg.barFont) or tonumber(cfg.font) or (OB.fontIndex["Roboto"] or 1)
-    local fontPath = OB.fontPaths[fontIndex] or STANDARD_TEXT_FONT
-    local size = tonumber(cfg.barFontSize) or tonumber(cfg.fontSize) or 12
-    local flags = OB.FontFlags(cfg.fontOutline)
+    local fontPath, size, flags = self:BarFontSpec()
 
     -- The stock status text is anchored for Blizzard's fixed font and several
     -- 1.12/Turtle builds expose more than one FontString. Styling all of them is
@@ -1719,8 +1733,53 @@ end
      built every time the default is taken. ]]--
 local DEFAULT_TOOLTIP_BG = { 0, 0, 0, 0.85 }
 
-function M:StyleTooltip(tip)
-    if not tip then return end
+--[==[ **Everything that makes a tooltip look like this addon's**, in one place
+     because there are two tooltips wearing it.
+
+     Ollie, 2026-09-29: *"tooltip vs fading tooltip that exists after mouse off.
+     fading has text border. these 2 states should share the EXACT same
+     settings."*
+
+     They did not share code. The live tooltip was styled here and the fade copy
+     restyled itself inside `SnapshotForFade` -- the same six calls written out a
+     second time, and already differing in small ways: the background fell back
+     to a literal `{0,0,0,0.85}` rather than to `DEFAULT_TOOLTIP_BG`, and the
+     border was applied before the colour rather than after.
+
+     **Two implementations of one job is the bug**, whichever of them is wrong
+     today. A setting added to one and forgotten in the other is invisible while
+     the mouse is still, and shows up the moment it moves away -- which is the
+     only moment both are on screen to compare. So there is one now, and the
+     copy cannot drift from the live one because it is the same code.
+
+     The health bar is deliberately not here: the copy draws its own, through
+     its own frames, and `StyleHealthBar` reaches for the client's. ]==]
+--[==[ **What the health bar's number is written in**, asked once.
+
+     These four lines existed three times: on the settings preview, on the live
+     bar, and on the fade copy. Three copies of one decision is three chances to
+     answer it differently, and the two that matter are on screen **at the same
+     time** the moment the mouse leaves -- the live tooltip and the copy fading
+     out beside it. That is the only moment a reader can compare them, which is
+     why a difference here is reported as the fade looking wrong rather than as a
+     setting being ignored.
+
+     Ollie, 2026-09-29: *"these 2 states should share the EXACT same settings"*.
+     The surest way to share settings is to share the code that reads them. ]==]
+function M:BarFontSpec()
+    local cfg = self:Config()
+
+    local index = tonumber(cfg.barFont) or tonumber(cfg.font)
+            or (OB.fontIndex["Roboto"] or 1)
+
+    return OB.fontPaths[index] or STANDARD_TEXT_FONT,
+           tonumber(cfg.barFontSize) or tonumber(cfg.fontSize) or 12,
+           OB.FontFlags(cfg.fontOutline)
+end
+
+function M:StyleTooltipChrome(tip)
+    if not tip then return false end
+
     local cfg = self:Config()
 
     if tip.SetScale then tip:SetScale(tonumber(cfg.scale) or 1) end
@@ -1752,6 +1811,15 @@ function M:StyleTooltip(tip)
     if tip.SetBackdropBorderColor then tip:SetBackdropBorderColor(0.45, 0.45, 0.5, 1) end
 
     self:StyleTooltipBorder(tip)
+
+    return true
+end
+
+function M:StyleTooltip(tip)
+    if not tip then return end
+    local cfg = self:Config()
+
+    self:StyleTooltipChrome(tip)
     self:StyleText(tip)
     self:StyleHealthBar(tip)
 end
@@ -2688,12 +2756,78 @@ function M:ForgetComparison()
     return self:HideComparisons()
 end
 
+--[==[ **A link, because 1.12's `GetItemInfo` does not take a name.**
+
+     Ollie, 2026-10-01: *"hold shift to compare is not showing the second
+     tooltip"*. This is why, and it was not an edge case -- it was every item.
+
+     `TooltipItemIdentity` returns `id, suffix, name`, and the comparison read
+     its **third** value into a variable called `link`. A name is a string and a
+     string is not nil, so the fall-back to the client's own `GetItem` -- which
+     would have answered with a real link -- never ran either. `GetItemInfo`
+     then got "Band of the Inquisition", answered nothing, and the comparison
+     decided the item could not be worn.
+
+     That exact constraint is written out thirty lines further up this file, in
+     `TooltipItemIdentity`, as the reason it keeps a bag link: *1.12's
+     GetItemInfo does not take a name*. The comparison was built against the
+     wrong return of the very function that says so.
+
+     So the thing a comparison starts from is asked for as a link, by a function
+     whose name says that is what it gives back. ]==]
+function M:TooltipItemLink(tip)
+    if not tip then return nil end
+
+    --[[ The client's own answer first. It is the only one that is right for
+         every tooltip -- bag, bank, merchant, loot, chat link, action bar --
+         because the client is what filled the frame. ]]--
+    if tip.GetItem then
+        local ok, _, link = pcall(tip.GetItem, tip)
+
+        if ok and type(link) == "string" and string.find(link, "item:%d") then
+            return link
+        end
+    end
+
+    --[[ Then the bag square this hover came from, remembered by the SetBagItem
+         wrapper. A container link carries the id and the suffix in full, and it
+         is the one identity that works for an item nobody has cached. ]]--
+    if tip.eqEcoBag ~= nil and tip.eqEcoBagSlot ~= nil
+            and type(GetContainerItemLink) == "function" then
+        local bagLink = GetContainerItemLink(tip.eqEcoBag, tip.eqEcoBagSlot)
+
+        if type(bagLink) == "string" and string.find(bagLink, "item:%d") then
+            return bagLink
+        end
+    end
+
+    --[==[ **Last, the id this module already worked out**, written back as the
+         shortest string `GetItemInfo` accepts.
+
+         The suffix is dropped on purpose. Where an item goes is a property of
+         the item, and no random enchantment has ever moved a ring off a
+         finger. ]==]
+    local itemId = self:TooltipItemIdentity(tip)
+    if itemId then return "item:" .. itemId end
+
+    return nil
+end
+
 --[[ Which paperdoll slots this item would go in, or nothing when it goes in
      none. The equip location is `GetItemInfo`'s eighth return. ]]--
 function M:CompareSlotsFor(link)
     if type(GetItemInfo) ~= "function" or not link then return nil end
 
-    local _, _, _, _, _, _, _, equipLoc = GetItemInfo(link)
+    --[==[ **Insisted on, not assumed.** A name is what this was handed for its
+         whole life, and the failure was silent: `GetItemInfo` answers nothing
+         for one, which reads identically to an item you cannot wear. Refusing
+         anything that is not an id or a link means the same mistake cannot be
+         made again without the test below saying so. ]==]
+    if type(link) == "string" and not string.find(link, "item:%d") then
+        return nil
+    end
+
+    local _, _, _, _, _, _, _, equipLoc = GetItemInfo(OB.ItemQuery(link))
     if type(equipLoc) ~= "string" or equipLoc == "" then return nil end
 
     return COMPARE_SLOTS[equipLoc]
@@ -2738,6 +2872,118 @@ end
      Returns how many were shown, so the caller can tell "nothing to compare"
      from "shift is not held" -- which are different reasons for an empty screen
      and only one of them is worth doing again next frame. ]==]
+--[==[ **Why the comparison is not on screen**, said out loud.
+
+     Ollie, 2026-09-30: *"shift to compare not working"*. Every step of
+     `ShowComparisons` works here and the setting is on in his profile, so what
+     is left is something about his client that this machine cannot see: a
+     `ShoppingTooltip` frame a fork does not ship, or an item whose equip slot
+     the client has not cached.
+
+     Each of those is a silent nil in the middle of a chain. This walks the same
+     chain and prints what every link answers, so the first one that gives
+     nothing is named rather than guessed at -- the same reason `/eq pvpdebug`
+     exists. ]==]
+function M:DebugCompare()
+    OB.Print("shift to compare:", "Tooltip")
+
+    OB.Raw("  setting: " .. tostring(self:Config().compareOnShift))
+
+    local shift = type(IsShiftKeyDown) == "function"
+            and IsShiftKeyDown() and true or false
+    OB.Raw("  shift held right now: " .. tostring(shift)
+            .. "   (run this with shift down to see true)")
+
+    for i = 1, table.getn(SHOPPING_TOOLTIPS) do
+        local frame = getglobal(SHOPPING_TOOLTIPS[i])
+        OB.Raw("  " .. SHOPPING_TOOLTIPS[i] .. ": "
+                .. (frame and "present" or "MISSING -- this client has no such frame"))
+    end
+
+    local tip = getglobal("GameTooltip")
+    OB.Raw("  tooltip shown: " .. tostring(tip and tip.IsShown and tip:IsShown()))
+
+    local link = self:TooltipItemLink(tip)
+
+    OB.Raw("  item under the cursor: " .. tostring(link))
+
+    if not link then
+        OB.Raw("  -- nothing to compare. Hover an item and run this again.")
+        return true
+    end
+
+    --[[ The equip slot is the step that fails quietly on an item the client has
+         not cached, which is every link seen for the first time. ]]--
+    local equipLoc = nil
+    if type(GetItemInfo) == "function" then
+        local ok, _, _, _, _, _, _, _, loc = pcall(GetItemInfo, OB.ItemQuery(link))
+        if ok then equipLoc = loc end
+    end
+
+    OB.Raw("  equip slot from GetItemInfo: " .. tostring(equipLoc)
+            .. (equipLoc and "" or "   (nil means the client has not cached this item)"))
+
+    local slots = self:CompareSlotsFor(link)
+    OB.Raw("  slots to compare: "
+            .. tostring(slots and table.getn(slots) or "none"))
+
+    if slots then
+        for i = 1, table.getn(slots) do
+            local worn = type(GetInventoryItemLink) == "function"
+                    and GetInventoryItemLink("player", slots[i]) or nil
+            OB.Raw("    slot " .. tostring(slots[i]) .. ": "
+                    .. (worn or "nothing worn -- nothing to hold it against"))
+        end
+    end
+
+    OB.Raw("  ShowComparisons returns: "
+            .. tostring(self:ShowComparisons(tip)))
+
+    --[==[ **And what is actually on screen afterwards.**
+
+         Reported broken three times, and every previous version of this
+         command stopped at "it returned 2". A 1.12 tooltip with no lines is **shown,
+         sized to nothing, and invisible**, and one anchored past the edge of
+         the screen is shown, full size, and invisible. Both look exactly like
+         the feature doing nothing, and neither could be told from working.
+
+         So: lines, size, where it is and how wide the screen is. Three numbers
+         that separate "it never ran", "it ran and drew an empty box" and "it
+         ran and drew it off the side of your monitor". ]==]
+    for i = 1, table.getn(SHOPPING_TOOLTIPS) do
+        local shop = getglobal(SHOPPING_TOOLTIPS[i])
+
+        if shop then
+            local lines = shop.NumLines and shop:NumLines() or 0
+            local w = shop.GetWidth and shop:GetWidth() or 0
+            local h = shop.GetHeight and shop:GetHeight() or 0
+
+            OB.Raw("  " .. SHOPPING_TOOLTIPS[i] .. ": shown "
+                    .. tostring(shop.IsShown and shop:IsShown())
+                    .. "   lines " .. tostring(lines)
+                    .. "   size " .. string.format("%.0f x %.0f", w, h)
+                    .. "   alpha " .. tostring(shop.GetAlpha and shop:GetAlpha()))
+
+            local first = tooltipLine(shop, "Left", 1)
+            OB.Raw("      first line: "
+                    .. tostring(first and first.GetText and first:GetText()))
+
+            local left = shop.GetLeft and shop:GetLeft()
+            local right = shop.GetRight and shop:GetRight()
+            local screen = UIParent and UIParent.GetRight and UIParent:GetRight()
+
+            OB.Raw("      left " .. tostring(left and math.floor(left))
+                    .. "  right " .. tostring(right and math.floor(right))
+                    .. "  screen width " .. tostring(screen and math.floor(screen))
+                    .. ((left and right and screen
+                            and (right < 0 or left > screen))
+                        and "   <-- OFF SCREEN" or ""))
+        end
+    end
+
+    return true
+end
+
 function M:ShowComparisons(tip)
     tip = tip or getglobal("GameTooltip")
     if not tip or not tip.IsShown or not tip:IsShown() then
@@ -2754,12 +3000,7 @@ function M:ShowComparisons(tip)
         return 0
     end
 
-    local _, _, link = self:TooltipItemIdentity(tip)
-    if not link and tip.GetItem then
-        local ok, _, itemLink = pcall(tip.GetItem, tip)
-        if ok then link = itemLink end
-    end
-
+    local link = self:TooltipItemLink(tip)
     local slots = link and self:CompareSlotsFor(link) or nil
     if not slots then
         self:HideComparisons()
@@ -3575,15 +3816,10 @@ function M:SnapshotForFade(source, keepHidden)
     copy:SetOwner(UIParent, "ANCHOR_NONE")
     copy:SetAlpha(1)
 
-    local cfg = self:Config()
-    if copy.SetScale then copy:SetScale(tonumber(cfg.scale) or 1) end
-    if copy.SetBackdrop then copy:SetBackdrop(self:TooltipBackdrop()) end
-    self:StyleTooltipBorder(copy)
-    if copy.SetBackdropColor then
-        local bg = cfg.backgroundColor or { 0, 0, 0, 0.85 }
-        copy:SetBackdropColor(bg[1] or 0, bg[2] or 0, bg[3] or 0, bg[4] or 0.85)
-    end
-    if copy.SetBackdropBorderColor then copy:SetBackdropBorderColor(0.45, 0.45, 0.5, 1) end
+    --[[ **The same chrome the live tooltip wears**, through the same function,
+         so the two states cannot disagree about a setting. This used to be the
+         same six calls written out again here. ]]--
+    self:StyleTooltipChrome(copy)
 
     local lines = source:NumLines() or 0
     if lines < 1 then return false end
@@ -3627,6 +3863,11 @@ function M:SnapshotForFade(source, keepHidden)
     self:StyleText(copy)
     if sourceWidth and sourceWidth > 0 and copy.SetWidth then copy:SetWidth(sourceWidth) end
     if sourceHeight and sourceHeight > 0 and copy.SetHeight then copy:SetHeight(sourceHeight) end
+
+    --[[ Kept so the size can be taken again when the fade actually starts. See
+         `MatchFadeToSource`: these two numbers are the snapshot's age made
+         visible, and the snapshot is always at least a little old. ]]--
+    self.fadeSource = source
 
 --[==[ **Every piece of the copied anchor is checked before it is used.**
 
@@ -3774,10 +4015,11 @@ function M:SnapshotForFade(source, keepHidden)
             end
         end
 
-        local fontIndex = tonumber(cfg.barFont) or tonumber(cfg.font) or (OB.fontIndex["Roboto"] or 1)
-        local fontPath = OB.fontPaths[fontIndex] or STANDARD_TEXT_FONT
-        local size = tonumber(cfg.barFontSize) or tonumber(cfg.fontSize) or 12
-        local flags = OB.FontFlags(cfg.fontOutline)
+        --[[ The same answer the live bar uses, through the same function. This
+             was the third copy of those four lines, and the copy that is on
+             screen beside the live one. ]]--
+        local fontPath, size, flags = self:BarFontSpec()
+
         self.fadeHealthText:SetFont(fontPath, size, flags)
         if not self.fadeHealthText:GetFont() then
             self.fadeHealthText:SetFont(STANDARD_TEXT_FONT, size, flags)
@@ -3894,6 +4136,43 @@ function M:CacheVisibleFadeSnapshot(tip, force)
     return ok and true or false
 end
 
+--[==[ **The copy is re-measured against the live tooltip as the fade begins.**
+
+     Reported by Ollie on 2026-09-24: *"still different when hovered and the
+     last hover fade. dimensions are different."*
+
+     The copy is sized from what the live tooltip measured **when the snapshot
+     was taken**, and that is never the moment the mouse leaves. The snapshot is
+     throttled to a tenth of a second, and ECO re-measures the live tooltip from
+     its own pass whenever its content changes -- a vendor price arriving, an
+     auction line, a unit row being rewritten. Every one of those widens the
+     tooltip *after* the copy was measured, so the copy held a stale number and
+     the tooltip visibly jumped the instant it began to fade. Measured in the
+     suite at **384 wide against the copy's 144**.
+
+     Taken here rather than by snapshotting more often: a snapshot copies every
+     line into a second frame, and doing that on every pass is the cost the
+     cache exists to avoid. Two numbers are cheap, and this is the one moment
+     they have to be right.
+
+     The live frame still holds its last size while hidden -- hiding a frame
+     does not resize it -- so this is the size the player was looking at. ]==]
+function M:MatchFadeToSource()
+    local copy = self.fadeTooltip
+    local source = self.fadeSource
+
+    if not copy or not source then return false end
+    if not source.GetWidth or not source.GetHeight then return false end
+
+    local width = source:GetWidth()
+    local height = source:GetHeight()
+
+    if width and width > 0 and copy.SetWidth then copy:SetWidth(width) end
+    if height and height > 0 and copy.SetHeight then copy:SetHeight(height) end
+
+    return true
+end
+
 function M:StartCachedFade()
     if not self.fadeCacheValid or not self.fadeTooltip then return false end
     if not self:Config().enableFade then
@@ -3911,6 +4190,35 @@ function M:StartCachedFade()
     self.fadeCacheValid = nil
     self.fadeCacheSignature = nil
     self.tickly = true
+
+    --[==[ **Copied again here, from the tooltip that is still on screen.**
+
+         v0.99.330 pinned the copy's width and height and stopped the box
+         changing size. That was half the fault. The **contents** were still
+         whatever the last snapshot caught, so a line added after it -- a vendor
+         price, an auction row, a rewritten unit line -- was simply not in the
+         copy: measured in the suite at **two lines against the live tooltip's
+         three**, in a box now correctly sized for three. A right-sized box
+         missing a line reads worse than the wrong-sized box did.
+
+         Snapshotting is what costs -- it copies every line into a second frame
+         -- and the cache exists so it is not done on every pass. Doing it
+         **once, here**, is one copy per hover, and this is the only moment that
+         has to be right.
+
+         **Only while the live tooltip can still be read.** The client empties
+         its tooltip on leave on some paths, and this runs from both; a source
+         with nothing left in it must not replace a good copy with an empty one,
+         which is the whole reason the cached copy is kept. ]==]
+    local source = self.fadeSource or getglobal("GameTooltip")
+    if source and source.NumLines and (source:NumLines() or 0) > 0 then
+        self:SnapshotForFade(source, true)
+    end
+
+    --[[ The size the player was looking at, after the fresh copy has been
+         built from it. ]]--
+    self:MatchFadeToSource()
+
     self.fadeTooltip:SetAlpha(1)
     self.fadeTooltip:Show()
     return true
@@ -4002,6 +4310,142 @@ function M:FinishFade()
     end
 end
 
+--[==[ **The client rebuilds a tooltip that is already up, on every frame.**
+
+     `PaperDollItemSlotButton_OnUpdate` is four lines long and the middle two
+     are `if GameTooltip:IsOwned(this) then PaperDollItemSlotButton_OnEnter()`
+     -- which is `SetOwner` followed by `SetInventoryItem`, and no `Show`,
+     because the tooltip never went away. `BuffButton_OnUpdate` does the same
+     with `SetPlayerBuff`, and the weapon-buff buttons through
+     `BuffFrame_EnchantButton_OnEnter`. All three are the client's own
+     FrameXML, read out of the MPQ rather than guessed at.
+
+     So the character sheet's slots and every buff icon tear their tooltip
+     down and build it again sixty times a second, and `OnShow` -- where this
+     addon's whole decoration pass hangs -- fires for none of it. The first
+     frame was ours and every frame after was the client's, which is why those
+     tooltips looked like plain vanilla ones and why nothing about them
+     flickered. Reported as the buff and character-sheet tooltips not being
+     ECO's.
+
+     The pass therefore runs from the same place the client repopulates: wrap
+     the `Set*` calls that fill a tooltip and decorate again the moment one of
+     them finishes **on a tooltip that is already visible**. One that is not
+     yet visible is left alone -- the `Show` about to follow fires `OnShow`,
+     and doing the work twice is only the work twice. ]==]
+local REPOPULATORS = {
+    "SetInventoryItem", "SetPlayerBuff", "SetUnitBuff", "SetUnitDebuff",
+    "SetHyperlink", "SetLootItem", "SetLootRollItem", "SetMerchantItem",
+    "SetBuybackItem", "SetCraftItem", "SetTradeSkillItem", "SetAuctionItem",
+    "SetAuctionSellItem", "SetInboxItem", "SetSendMailItem", "SetQuestItem",
+    "SetQuestLogItem", "SetTradePlayerItem", "SetTradeTargetItem",
+    "SetAction", "SetSpell",
+}
+
+--[[ Re-decorate a live tooltip the client has just refilled.
+
+     Everything this addon added went out with the rest of the lines, so the
+     markers that mean "this one already has them" go too, or the value block
+     and the drop lines would decline to come back. ]]--
+function M:AfterRepopulate(tip)
+    if self.repopulating then return false end
+    if not tip or tip ~= GameTooltip then return false end
+    if not OB.ModuleEnabled("tooltip") then return false end
+    if not tip.IsShown or not tip:IsShown() then return false end
+
+    --[[ A fade is showing a *copy*; the live frame behind it is being taken
+         apart deliberately and is not what anybody is looking at. ]]--
+    if self.fading then return false end
+
+    tip.eqEcoPriceActive = nil
+    tip.eqEcoPriceKey = nil
+    tip.eqEcoPriceShift = nil
+    tip.eqEcoLootKey = nil
+
+    --[[ Measured the way `OnShow` measures it: the width the client has just
+         finished building, before any row of ours widens it. ]]--
+    local natural = tip.GetWidth and tip:GetWidth() or nil
+    tip.eqEcoNaturalWidth = natural and natural > 0 and natural or nil
+
+    --[[ The guard is cleared before the error travels on, so one bad pass
+         cannot leave every later one switched off. ]]--
+    self.repopulating = true
+    local ok, err = pcall(self.Decorate, self, tip)
+    self.repopulating = nil
+    if not ok then error(err, 0) end
+
+    return true
+end
+
+--[==[ **Taken over rather than stacked on**, the same as the `OnShow` wrapper
+     a few functions down and for the same reason: the guard lives on a module
+     table that a reload rebuilds, while the method sits on a frame that it
+     does not. The pair is kept in a global so the next load can recognise its
+     own wrapper and wrap what *that* was wrapping. ]==]
+function M:InstallRepopulationHooks()
+    if not GameTooltip then return 0 end
+
+    EquadisOverhaulTooltipRepop = EquadisOverhaulTooltipRepop or {}
+    self.repopWrappers = self.repopWrappers or {}
+    self.repopOriginals = self.repopOriginals or {}
+
+    local installed = 0
+
+    for i = 1, table.getn(REPOPULATORS) do
+        local name = REPOPULATORS[i]
+        local current = GameTooltip[name]
+
+        if type(current) == "function" and current ~= self.repopWrappers[name] then
+            local previous = current
+            local known = EquadisOverhaulTooltipRepop[name]
+
+            if known and current == known.wrapper and known.inner then
+                previous = known.inner
+            end
+
+            --[[ Fixed arity rather than a vararg: Lua 5.0 has no `...`
+                 expression, and the widest of these takes three. ]]--
+            local wrapper = function(tip, a, b, c)
+                local r1, r2, r3, r4, r5 = previous(tip, a, b, c)
+                local m = EquadisClassicOverhaul.modules.tooltip
+                if m then m:AfterRepopulate(tip) end
+                return r1, r2, r3, r4, r5
+            end
+
+            EquadisOverhaulTooltipRepop[name] = { wrapper = wrapper, inner = previous }
+            self.repopOriginals[name] = previous
+            self.repopWrappers[name] = wrapper
+            GameTooltip[name] = wrapper
+            installed = installed + 1
+        end
+    end
+
+    return installed
+end
+
+--[[ Hand every one of them back. A tooltip left with our wrapper on it after
+     the module is switched off is a leftover nobody can trace to anything on
+     screen -- the same rule the enchant hovers are restored under. ]]--
+function M:RestoreRepopulationHooks()
+    if not GameTooltip or not self.repopWrappers then return 0 end
+
+    local given = 0
+
+    for name, wrapper in pairs(self.repopWrappers) do
+        if GameTooltip[name] == wrapper and self.repopOriginals[name] then
+            GameTooltip[name] = self.repopOriginals[name]
+            if EquadisOverhaulTooltipRepop then
+                EquadisOverhaulTooltipRepop[name] = nil
+            end
+            given = given + 1
+        end
+    end
+
+    self.repopWrappers = nil
+    self.repopOriginals = nil
+    return given
+end
+
 function M:InstallTooltip()
     if not GameTooltip or not GameTooltip.GetScript or not GameTooltip.SetScript then
         return false
@@ -4025,13 +4469,20 @@ function M:InstallTooltip()
         wrapper = function(tip, bag, slot)
             local a, b, c, d, e = previousSetBagItem(tip, bag, slot)
             local m = EquadisClassicOverhaul.modules.tooltip
-            if m then m:RememberBagStack(tip, bag, slot) end
+            if m then
+                --[[ The stack first: `AfterRepopulate` prices what it finds,
+                     and what it finds is this slot. ]]--
+                m:RememberBagStack(tip, bag, slot)
+                m:AfterRepopulate(tip)
+            end
             return a, b, c, d, e
         end
         self.previousSetBagItem = previousSetBagItem
         self.bagItemWrapper = wrapper
         GameTooltip.SetBagItem = wrapper
     end
+
+    self:InstallRepopulationHooks()
 
     --[==[ **The tooltips that never asked for a default anchor.**
 
@@ -4384,12 +4835,13 @@ function M:InstallTooltip()
                      shift is held first and the mousing happens second. So what
                      is watched is the pair -- the key and what is under the
                      cursor. ]==]
-                local onItem
-
-                if GameTooltip.GetItem then
-                    local ok, _, itemLink = pcall(GameTooltip.GetItem, GameTooltip)
-                    if ok then onItem = itemLink end
-                end
+                --[[ Asked through the same function the comparison itself
+                     starts from, so "has what I am pointing at changed" and
+                     "what am I pointing at" can never disagree. Reading
+                     `GetItem` straight meant two uncached items in a row both
+                     answered nil, and moving between them looked like not
+                     moving at all. ]]--
+                local onItem = m:TooltipItemLink(GameTooltip)
 
                 if wantCompare ~= m.comparing or onItem ~= m.comparedItem then
                     m.comparing = wantCompare
@@ -4599,6 +5051,8 @@ function M:OnUnbind()
                 and self.previousSetBagItem then
             GameTooltip.SetBagItem = self.previousSetBagItem
         end
+
+        self:RestoreRepopulationHooks()
     end
     self.tickly = false
     self:RestoreVisuals()

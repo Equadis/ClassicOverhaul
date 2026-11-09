@@ -76,7 +76,6 @@ AtlasCFM.InstanceData.OnyxiasLair = {
                 { id = 15410, disc = L["Reagent"],                                                                                                dropRate = 100,                                container = { 17967, 15138, 15141 } }, -- Scale of Onyxia
                 {},
                 { id = 26243, dropRate = 1,                                                                                                       servers = { AtlasCFM.Server.VANILLA_PLUS } },                                       -- Stave of Errant Vision
-                { id = 30017, dropRate = 1.5,                                                                                                     servers = { AtlasCFM.Server.TURTLE1 } },                                            --Onyxian Drake
                 {},
                 { id = 21108, disc = L["Quest Item"],                                                                                             dropRate = 100,                                container = { 21111 } },             -- Draconic for Dummies
                 { id = 17962, disc = L["Container"],                                                                                              dropRate = 20,                                 container = { 13926, 7971, 3864, 55251, 55250, 7910, 7909, 1529, 12361 },                                                                                      servers = { AtlasCFM.Server.TURTLE1 } }, -- Blue Sack of Gems

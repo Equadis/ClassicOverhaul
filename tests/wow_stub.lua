@@ -127,7 +127,7 @@ end
 
 local function definePoints(o)
     o.points = {}
-    o.ClearAllPoints = function(self) self.points = {} end
+    o.ClearAllPoints = function(self) self.points = {}; self.fills = nil end
     o.SetPoint = function(self, point, rel, relPoint, x, y)
         table.insert(self.points, { point, rel, relPoint, x, y })
     end
@@ -143,7 +143,19 @@ local function definePoints(o)
         if not p then return nil end
         return p[1], p[2], p[3], p[4], p[5]
     end
-    o.SetAllPoints = function(self) end
+    --[==[ **`SetAllPoints` records what it fills, because it was a no-op.**
+
+         A region sized this way reported a width of nought, so nothing that
+         fills its parent could be tested at all -- "the icon covers the button"
+         and "the icon is a point in the corner" were the same measurement. The
+         bag button's picture is sized exactly this way, and the icon being
+         empty is what was reported.
+
+         Only the *size* follows, and only while nothing explicit was set, so a
+         region given its own width still answers with it. ]==]
+    o.SetAllPoints = function(self, target)
+        self.fills = target or self.parent
+    end
 
     --[[ **Screen edges, modelled rather than left to the auto-faking
          metatable.**
@@ -317,8 +329,20 @@ local function defineSize(o)
     o.width, o.height = 0, 0
     o.SetWidth = function(self, v) self.width = v end
     o.SetHeight = function(self, v) self.height = v end
-    o.GetWidth = function(self) return self.width end
-    o.GetHeight = function(self) return self.height end
+
+    --[[ What `SetAllPoints` filled, when this has no size of its own. See the
+         note on `SetAllPoints`. ]]--
+    o.GetWidth = function(self)
+        if self.width and self.width > 0 then return self.width end
+        if self.fills and self.fills.GetWidth then return self.fills:GetWidth() end
+        return self.width
+    end
+
+    o.GetHeight = function(self)
+        if self.height and self.height > 0 then return self.height end
+        if self.fills and self.fills.GetHeight then return self.fills:GetHeight() end
+        return self.height
+    end
 end
 
 local function newTexture(parent, layer)
@@ -446,10 +470,55 @@ local function newFontString(parent, layer, inherits)
         self.text = tostring(v)
     end
     f.GetText = function(self) return self.text end
+    --[==[ **`SetFont` can fail, and when it does it leaves no font at all.**
+
+         This stored whatever it was handed -- a nil path, a size of zero -- so
+         `GetFont` always answered and **the failure path in `OB.ApplyFont` could
+         never run**. The addon's own fallbacks were therefore unreachable from
+         the suite, and a bug that made a failure permanent sat behind them until
+         a player's `/eq selftest` counted three fontless strings.
+
+         The client's rule, modelled: a size that is not a positive number, or a
+         path that is not a usable string, leaves the FontString with **no font
+         object** -- not the previous one. `Stub.missingFonts[path] = true` makes
+         a specific file unloadable, which is the third way it fails in the
+         game and the one an addon cannot predict. ]==]
     f.SetFont = function(self, path, size, flags)
+        if type(path) ~= "string" or path == ""
+                or type(size) ~= "number" or size <= 0
+                or (Stub.missingFonts and Stub.missingFonts[path]) then
+            self.font, self.fontSize, self.fontFlags = nil, nil, nil
+            return
+        end
+
         self.font, self.fontSize, self.fontFlags = path, size, flags
     end
     f.GetFont = function(self) return self.font, self.fontSize, self.fontFlags end
+
+    --[==[ **The other way a font changes, and the one an addon never sees
+         coming.**
+
+         `SetFontObject` swaps the whole font -- face, size and flags -- from a
+         named object. 1.12 uses it on the tooltip's **first line**: building a
+         tooltip with `SetText` re-applies `GameTooltipHeaderText` to
+         `GameTooltipTextLeft1`, which is a larger face, and it happens *after*
+         an addon has styled that line.
+
+         Nothing modelled it, so a skip that trusted its own record of what it
+         last applied looked correct here and left the client's header font in
+         place in the game. Modelled as what it is: a font change this addon did
+         not make. ]==]
+    f.SetFontObject = function(self, object)
+        local name = object
+        if type(object) == "table" and object.eqStubFontName then
+            name = object.eqStubFontName
+        end
+
+        self.font = "object:" .. tostring(name)
+        self.fontSize = nil
+        self.fontFlags = nil
+    end
+
     f.SetTextColor = function(self, r, g, b)
         requireFont(self, "SetTextColor")
         self.color = { r, g, b }
@@ -683,6 +752,17 @@ templates.GameTooltipTemplate = function(frame)
     frame.lines = {}
     frame.lineCount = 0
 
+    --[[ The health bar every unit tooltip carries. It is the first child, which
+         is how `GetChildren()` is used to find it -- the client offers no name
+         for it on a tooltip an addon made. ]]--
+    frame.children = frame.children or {}
+    if table.getn(frame.children) == 0 then
+        local bar = CreateFrame("StatusBar", nil, frame)
+        bar:SetMinMaxValues(0, 1)
+        bar:SetValue(0)
+        table.insert(frame.children, bar)
+    end
+
     frame.Line = function(self, i)
         if not self.lines[i] then
             self.lines[i] = newFontString(self, "OVERLAY", "GameTooltipText")
@@ -702,9 +782,60 @@ templates.GameTooltipTemplate = function(frame)
     frame.ClearLines = function(self)
         self.lineCount = 0
         for i = 1, table.getn(self.lines) do self.lines[i]:Hide() end
+
+        --[[ The item goes with the lines. `GetItem` on an emptied tooltip
+             answers nothing in the client too. ]]--
+        self.eqStubItemName = nil
+        self.eqStubItemLink = nil
     end
 
     frame.NumLines = function(self) return self.lineCount end
+
+    --[==[ **What the client says is in this tooltip, which nothing modelled at
+         all.**
+
+         `GameTooltip:GetItem()` returns the name and the link of the item the
+         *client* put in the frame. It is the authoritative identity and the
+         first thing any item-aware tooltip code should ask -- and because it was
+         missing here, every branch guarded by `if tip.GetItem then` was dead
+         code in this suite. The shift-to-compare fall-back lived in one of them
+         and had never run.
+
+         Set by the `Set*` methods that fill a tooltip from a real item, and
+         nowhere else: a tooltip written line by line by a test has no item in
+         it, and the client would say so. ]==]
+    frame.GetItem = function(self)
+        return self.eqStubItemName, self.eqStubItemLink
+    end
+
+    --[==[ **Pointing a tooltip at a unit, which nothing modelled -- and the
+         reason the feign-health scrape had never once run in this suite.**
+
+         `modules/unitframes.lua` keeps a scanning tooltip to read a feigning
+         hunter's real health off the tooltip's own status bar. It begins `if
+         not tip.SetUnit then return nil end`, and `SetUnit` did not exist here,
+         so **every call returned nil at the first line** and the whole feature
+         was dead code as far as the suite was concerned.
+
+         **`SetUnit` shows the tooltip.** That is the part that matters and the
+         part an addon forgets: every `Set*` on a 1.12 tooltip is "fill this in
+         and put it on screen". A scanning tooltip that is never hidden again is
+         a tooltip sitting on the player's screen, which is what got reported.
+         Modelled here so forgetting it fails. ]==]
+    frame.SetUnit = function(self, unit)
+        self:ClearLines()
+        self:AddLine(UnitName and UnitName(unit) or tostring(unit))
+
+        --[[ The client fills the tooltip's own status bar with the unit's real
+             health, which is exactly what the scrape is there to read. ]]--
+        local bar = self.children and self.children[1]
+        if bar and bar.SetValue and UnitHealth then
+            bar:SetValue(UnitHealth(unit) or 0)
+        end
+
+        self:Show()
+        return true
+    end
     --[==[ **Who owns the tooltip and how it is anchored, which was recorded by
          nothing.**
 
@@ -733,6 +864,23 @@ templates.GameTooltipTemplate = function(frame)
          breakdown is a name on the left and a number on the right, and a stub
          that dropped one of them could not tell a correct row from an empty
          one. ]]--
+    --[==[ **`SetText` starts a tooltip; it does not set a caption.**
+
+         The client's own shape for every text-only tooltip is `SetOwner`,
+         `SetText`, `AddLine`, `Show` -- `PaperDollStatTooltip` and
+         `CharacterDamageFrame_OnEnter` both, read out of the MPQ. `SetText`
+         is the call that drops what was there and writes line one.
+
+         Letting the generic frame's edit-box `SetText` answer instead modelled
+         a tooltip that appends to the last one for ever, and ECO's own stat
+         rows were doing exactly that with nothing here able to see it. ]==]
+    frame.SetText = function(self, text)
+        self:ClearLines()
+        self.lineCount = 1
+        self:Line(1):SetText(text or "")
+        self:Line(1):Show()
+    end
+
     frame.AddLine = function(self, text)
         self.lineCount = self.lineCount + 1
         self:Line(self.lineCount):SetText(text or "")
@@ -780,6 +928,12 @@ templates.GameTooltipTemplate = function(frame)
         if not item then return end
 
         self:AddLine(item.name)
+
+        --[[ The client knows which item this is. See `GetItem`. ]]--
+        self.eqStubItemName = item.name
+        self.eqStubItemLink = item.link
+                or ("|cffffffff|Hitem:" .. tostring(item.id or 0)
+                        .. ":0:0:0|h[" .. tostring(item.name) .. "]|h|r")
 
         --[[ The client only prints it at a vendor. That is the constraint the
              whole learned-price store exists to work around, so it is real
@@ -860,6 +1014,11 @@ templates.GameTooltipTemplate = function(frame)
 
         self:AddLine(roll.name)
 
+        self.eqStubItemName = roll.name
+        self.eqStubItemLink = roll.link
+                or ("|cffffffff|Hitem:" .. tostring(id) .. ":0:0:0|h["
+                        .. tostring(roll.name) .. "]|h|r")
+
         local price = nil
         if MerchantFrame and MerchantFrame:IsVisible() then price = roll.price end
         if price then price = price * (roll.count or 1) end
@@ -899,7 +1058,46 @@ templates.GameTooltipTemplate = function(frame)
         self.lineCount = table.getn(block)
     end
 
-    frame.SetInventoryItem = function(self, unit, slot) load(self, "item" .. slot) end
+    --[==[ **A worn item's tooltip, filled from the item that is worn.**
+
+         This read `Stub.tooltips["item" .. slot]` and nothing else -- a fixture
+         almost nothing sets. With none, it cleared the lines and returned, so
+         the tooltip came out **empty and no error was raised**. Shift-to-compare
+         is built on exactly this call, and its test could only ever ask
+         `IsShown()` -- which an empty frame answers yes to. A comparison that
+         draws a blank rectangle and one that draws your helm were the same
+         result here.
+
+         Falls back to `Stub.equipped` and `Stub.items`, which is where every
+         other worn-item call already looks, so a slot with something in it
+         produces a tooltip with that thing's name on line one. A fixture that
+         sets `Stub.tooltips` explicitly still wins, because some tests want
+         particular lines. ]==]
+    frame.SetInventoryItem = function(self, unit, slot)
+        if Stub.tooltips["item" .. tostring(slot)] then
+            load(self, "item" .. slot)
+            return
+        end
+
+        self:ClearLines()
+
+        local entry = Stub.equipped and Stub.equipped[slot]
+        local id = entry and entry[1]
+        local known = id and Stub.items and Stub.items[id]
+
+        if not entry then return nil end
+
+        self:AddLine((known and known.name) or "Test Item")
+        self.eqStubItemName = (known and known.name) or "Test Item"
+        self.eqStubItemLink = "|cffffffff|Hitem:" .. tostring(id or 0)
+                .. ":0:0:0|h[" .. tostring(self.eqStubItemName) .. "]|h|r"
+
+        --[[ The client's setters put the tooltip on screen themselves. ]]--
+        local onShow = self:GetScript("OnShow")
+        if onShow then onShow() end
+
+        return 1
+    end
     frame.SetSpell = function(self, index, bookType) load(self, "spell" .. index) end
 
     --[[ A talent's tooltip, keyed "talent<tab>:<index>" like GetTalentInfo's
@@ -1095,6 +1293,42 @@ function CreateFrame(ftype, name, parent, template)
 
     f.GetScript = function(self, which) return self.scripts[which] end
     f.HasScript = function() return true end
+
+    --[==[ **Clicking a button, and the two halves of a keypress.**
+
+         Neither existed, so the auto-faking metatable answered both and the
+         path a *keybinding* takes to a spell could not be tested at all. That
+         path is the whole of "shift plus a key casts something", and this addon
+         re-parents every action button onto a container of its own -- so
+         whether a binding still reaches its button after that was a question
+         the suite had no way to ask.
+
+         `Click` fires the button's own `OnClick` with `this` set, the way the
+         client does, and it does so **whether or not the button is visible**:
+         1.12 has no protected frames, and an action button parked out of sight
+         still casts when its key is pressed. A stub that refused would invent a
+         rule the client does not have. ]==]
+    f.clicks = 0
+
+    f.Click = function(self, which)
+        self.clicks = (self.clicks or 0) + 1
+        self.lastClick = which or "LeftButton"
+
+        local handler = self.scripts and self.scripts.OnClick
+        if not handler then return end
+
+        local savedThis, savedArg = this, arg1
+        this, arg1 = self, which or "LeftButton"
+        handler()
+        this, arg1 = savedThis, savedArg
+    end
+
+    f.SetButtonState = function(self, state, locked)
+        self.buttonState = state
+        self.buttonLocked = locked and true or false
+    end
+
+    f.GetButtonState = function(self) return self.buttonState or "NORMAL" end
 
     f.RegisterForClicks = function(self)
         if self.frameType ~= "Button" and self.frameType ~= "CheckButton" then
@@ -1695,7 +1929,7 @@ DEAD = "Dead"
 --[[ The faction icon the countdown explains. A real region, because the
      readout anchors to it and an anchor to nothing is the difference between
      "under the icon" and "in the top-left corner of the screen". ]]--
-Stub.pvp = { flagged = false, timer = 301000 }
+Stub.pvp = { flagged = false, timer = 301000, desired = false }
 
 function UnitIsPVP(unit)
     if unit ~= "player" then return nil end
@@ -1703,6 +1937,26 @@ function UnitIsPVP(unit)
 end
 
 function GetPVPTimer() return Stub.pvp.timer end
+
+--[==[ **`/pvp` is `TogglePVP()` and nothing else**, which the client's own
+     `ChatFrame.lua` says in one line: `SlashCmdList["PVP"] = TogglePVP`. It
+     was missing here, so the one call that changes the *desired* flag -- as
+     opposed to the flag you can already see -- could not be driven at all, and
+     an addon reading a flag change as "PvP was switched off" had nothing to
+     contradict it.
+
+     Turning it on flags you at once; turning it off leaves you flagged while
+     the grace period runs, which is exactly the state the countdown exists
+     for. Both fire `PLAYER_FLAGS_CHANGED` for the player, and both leave AFK
+     and DND alone -- the same event, opposite meanings. ]==]
+function TogglePVP()
+    Stub.pvp.desired = not Stub.pvp.desired
+
+    if Stub.pvp.desired then Stub.pvp.flagged = true end
+
+    Stub.FireEvent("PLAYER_FLAGS_CHANGED", "player")
+    return Stub.pvp.desired
+end
 
 --[==[ **A group member can be dead on their own now.**
 
@@ -2081,6 +2335,65 @@ PaperDollFrame = CreateFrame("Frame", "PaperDollFrame", nil)
 CharacterAttributesFrame = CreateFrame("Frame", "CharacterAttributesFrame",
         PaperDollFrame)
 
+--[==[ **The spellbook, which nothing modelled.**
+
+     1.12 builds this frame at load rather than on first open, and the column of
+     skill-line tabs down its right edge is where an addon adds a tab of its
+     own. Without it here, any such tab is `nil` and every assertion about it
+     passes by never running -- the shape of hole that lets a whole feature ship
+     untested.
+
+     The two page buttons are here for the same reason: they are siblings of
+     anything drawn over the book, so a panel that covers it has to put them
+     away or clicks land behind it. ]==]
+SpellBookFrame = CreateFrame("Frame", "SpellBookFrame", UIParent)
+SpellBookFrame:SetWidth(384)
+SpellBookFrame:SetHeight(512)
+SpellBookFrame:Hide()
+
+SpellBookPrevPageButton = CreateFrame("Button", "SpellBookPrevPageButton",
+        SpellBookFrame)
+SpellBookNextPageButton = CreateFrame("Button", "SpellBookNextPageButton",
+        SpellBookFrame)
+
+--[==[ **What the book actually draws**, which is the part that mattered and was
+     not here.
+
+     A frame laid over the spellbook is transparent unless something is done
+     about it, and 1.12 keeps the twelve spell buttons, the page number and the
+     skill-line tabs as **siblings** of anything an addon adds -- so they go on
+     being drawn underneath. With only the frame and its two page buttons
+     modelled, a panel could cover the book in the harness while covering
+     nothing at all in the game, which is exactly what shipped in v0.99.327:
+     the client's spell icons showed through the training list and were reported
+     as the icons being bugged.
+
+     `SPELLS_PER_PAGE` and `MAX_SKILLLINE_TABS` are the client's own constants,
+     read out of its `SpellBookFrame.lua` rather than picked. ]==]
+SPELLS_PER_PAGE = 12
+MAX_SKILLLINE_TABS = 8
+
+SpellBookPageText = SpellBookFrame:CreateFontString("SpellBookPageText",
+        "OVERLAY")
+
+for i = 1, SPELLS_PER_PAGE do
+    local button = CreateFrame("Button", "SpellButton" .. i, SpellBookFrame)
+
+    --[==[ **The client never hides these buttons; it empties them.**
+
+         `SpellButton_UpdateButton` hides the *icon, the name and the rank* when
+         a slot has no spell, and it begins `if not this:IsVisible() then
+         return end` -- so a button an addon hides stops being repainted
+         entirely. Anything that hides one has to show it again and let the
+         client fill it, rather than trying to fill it itself. ]==]
+    button.contentsShown = true
+    Stub["spellButton" .. i] = button
+end
+
+for i = 1, MAX_SKILLLINE_TABS do
+    CreateFrame("CheckButton", "SpellBookSkillLineTab" .. i, SpellBookFrame)
+end
+
 Stub.stats = {
     armor = 1684,
     attackPower = 634,
@@ -2206,10 +2519,24 @@ end
      This is how a plain client tells a hunter's Auto Shot from a warrior's Shoot
      Gun -- the two fire the same gun to different distances, and getting it wrong
      told a warrior a forty-yard target was in range. ]]--
+--[==[ **And the rank, which this always answered as an empty string.**
+
+     `GetSpellName` returns *two* things and the second one is how the client
+     tells Heroic Strike 9 from Heroic Strike 1. Anything joining the spellbook
+     to a table keyed by name **and rank** -- which is the only key 1.12 offers,
+     since there is no "do I know spell 25286" call -- could therefore match
+     nothing at all, or match rank 1 for every rank, and the harness would agree
+     with it either way.
+
+     A plain string stays a spell with no rank, which is most of them. A
+     `{ name, rank }` pair is a ranked one. ]==]
 function GetSpellName(index, bookType)
-    local name = Stub.player.spellNames and Stub.player.spellNames[index]
-    if not name then return nil end
-    return name, ""
+    local entry = Stub.player.spellNames and Stub.player.spellNames[index]
+    if not entry then return nil end
+
+    if type(entry) == "table" then return entry[1], entry[2] or "" end
+
+    return entry, ""
 end
 
 function GetLocale() return Stub.locale or "enUS" end
@@ -2409,8 +2736,20 @@ end
 --[[ Nineteen equipment slots; a test names only the ones it cares about. ]]--
 Stub.equipped = {}
 
+--[==[ **A texture, not the fixture row.**
+
+     This handed back `Stub.equipped[slot]`, which is a table of `{ id, subtype
+     }` -- where the client answers with an icon path. Anything reading it got a
+     table and could not tell, because nothing had ever read it: the return was
+     wrong in the one way a stub is allowed to be until somebody uses it.
+
+     The third field of an equipped row is the icon when a fixture gives one;
+     otherwise a plain default, so every existing fixture keeps working. ]==]
 function GetInventoryItemTexture(unit, slot)
-    return Stub.equipped[slot]
+    local entry = Stub.equipped[slot]
+    if not entry then return nil end
+
+    return entry[3] or "Interface\\Icons\\INV_Misc_QuestionMark"
 end
 
 Stub.castCalls = {}
@@ -2775,10 +3114,21 @@ end
      fuller inventory model would be scenery. ]]--
 Stub.equipped = {}
 
+--[==[ **Named after the item, when the fixture says what it is.**
+
+     Every worn item answered `[Test Item]`, so nothing that reads a worn item's
+     *name* could be tested: the right item and the wrong one produced the same
+     string. `Stub.items` already holds names by id, so the link uses one when
+     there is one and keeps the old placeholder when there is not -- which is
+     every fixture written before this. ]==]
 function GetInventoryItemLink(unit, slot)
     local item = Stub.equipped[slot]
     if not item then return nil end
-    return "|cffffffff|Hitem:" .. item[1] .. ":0:0:0|h[Test Item]|h|r"
+
+    local known = Stub.items and Stub.items[item[1]]
+    local name = (known and known.name) or "Test Item"
+
+    return "|cffffffff|Hitem:" .. item[1] .. ":0:0:0|h[" .. name .. "]|h|r"
 end
 
 --[==[ **Every slot, because answering nought for eighteen of them made any
@@ -2863,9 +3213,29 @@ Stub.itemClasses = {
     { name = "Trade Goods", subs = { "Trade Goods", "Parts", "Explosives",
         "Devices", "Cloth", "Leather", "Metal & Stone", "Meat", "Herb",
         "Elemental", "Other", "Enchanting", "Materials" } },
+
+    --[==[ **Four classes were missing, and the order is the client's.**
+
+         `GetAuctionItemClasses` answers ten names in a fixed sequence --
+         Weapon, Armor, Container, Consumable, Trade Goods, Projectile, Quiver,
+         Recipe, Reagent, Miscellaneous -- and the sequence is the same in every
+         language. That is what makes it usable as a locale-proof ranking: what
+         a class is *called* varies, what position it holds does not.
+
+         This list stopped at six and put Recipe sixth, where the client puts
+         Projectile. Anything reading a rank off the position therefore read the
+         wrong one, and the four classes a bag is fullest of -- arrows, quivers,
+         reagents and **junk** -- could not be ranked at all.
+
+         The subclasses are the client's own for each. ]==]
+    { name = "Projectile", subs = { "Arrow", "Bullet" } },
+    { name = "Quiver", subs = { "Quiver", "Ammo Pouch" } },
     { name = "Recipe", subs = { "Book", "Leatherworking", "Tailoring",
         "Engineering", "Blacksmithing", "Cooking", "Alchemy", "First Aid",
         "Enchanting", "Fishing" } },
+    { name = "Reagent", subs = { "Reagent" } },
+    { name = "Miscellaneous", subs = { "Junk", "Reagent", "Pet", "Holiday",
+        "Other" } },
 }
 
 
@@ -3148,32 +3518,79 @@ end
      wrong. ]==]
 AUCTION_CATEGORY_QUEST = "Quest"
 
+--[==[ **An id or a link. A name gets nothing, because 1.12 gives nothing.**
+
+     This used to walk `Stub.items` looking for a matching `name`, so a bare
+     item name resolved here and answered in full. The real 1.12 client does
+     not: `GetItemInfo` takes an item id, an item string or an item link, and a
+     name is simply not a key it has. That constraint is written out in
+     `modules/tooltip.lua` as the reason `TooltipItemIdentity` keeps a bag link
+     around at all.
+
+     The convenience hid a real bug for as long as it existed. Shift-to-compare
+     read an item's *name* into a variable called `link` and handed it straight
+     to `GetItemInfo`; here that worked, in game it answered nothing and the
+     comparison concluded the item could not be worn -- every item, every time,
+     reported twice. Removing the lookup failed exactly the four assertions that
+     covered the feature and nothing else in 6,831, which is what a convenience
+     propping up a single bug looks like. ]==]
+--[==[ **A decorated hyperlink is refused, because this client refuses one.**
+
+     Ollie, 2026-10-23, `/eq comparedebug` while hovering a pair of boots:
+
+         item under the cursor: [Loose Chain Boots]
+         equip slot from GetItemInfo: nil
+
+     A real link, a common item, its tooltip on screen -- and `GetItemInfo`
+     answered nothing. The same for a Mining Pick. Not a caching problem: the
+     **argument form** is what it will not take.
+
+     The client's own code never passes a link. `ContainerFrame.lua` calls
+     `GetItemInfo(tonumber(id))` and `MerchantFrame.lua` `GetItemInfo(id or 0)`;
+     aux passes a bare item string. Every call in this addon that passes an id
+     works and every call that passes a link is a feature that has been reported
+     broken.
+
+     This used to pull `item:(%d+)` out of **any** string, so a full
+     `|cff...|Hitem:2385:0:0:0|h[Name]|h|r` resolved here and nowhere else.
+     Modelled the client's way round now: a number, or a string that *is* an
+     item string. Anything wrapped in colour and hyperlink escapes gets
+     nothing. ]==]
 function GetItemInfo(item)
     local id = tonumber(item)
-    if not id then
-        local _, _, found = string.find(tostring(item), "item:(%d+)")
-        id = tonumber(found)
-    end
 
-    if not id then
-        for known, entry in pairs(Stub.items) do
-            if entry and entry.name == item then id = known end
-        end
+    if not id and type(item) == "string" then
+        --[[ An item string and nothing else: it has to *start* with `item:`,
+             which a decorated link does not. ]]--
+        local _, _, found = string.find(item, "^item:(%d+)")
+        id = tonumber(found)
     end
 
     if not id then return nil end
 
-    for slot, entry in pairs(Stub.equipped) do
-        if entry[1] == id then
-            return "Test Item", "|Hitem:" .. id .. "|h", 2, 60, "Weapon", entry[2],
-                    1, "Ranged", nil
+    --[==[ **What the fixture says about an item outranks the fact that it is
+         being worn.**
+
+         The equipped branch below answers `"Weapon"` / `"Ranged"` for anything
+         in any slot, and it was asked *first* -- so an item a test had described
+         in full came back as a hardcoded ranged weapon the moment it was also
+         equipped. A test that put a ring on a finger and then asked where a ring
+         goes was answered "the bow slot", and could not tell that from a module
+         reading the wrong field.
+
+         The equipped branch is still here, for an id a fixture never described,
+         and it still answers the junk it always did -- which every test written
+         against it expects. ]==]
+    local known = Stub.items[id]
+
+    if not known then
+        for slot, entry in pairs(Stub.equipped) do
+            if entry[1] == id then
+                return "Test Item", "|Hitem:" .. id .. "|h", 2, 60, "Weapon",
+                        entry[2], 1, "Ranged", nil
+            end
         end
     end
-
-    --[[ Anything the cache has been told about. Separate from the equipped list
-         because an item you have seen in a link is not an item you are
-         wearing, and the link code only ever asks the first question. ]]--
-    local known = Stub.items[id]
 
     --[[ **Type, subtype and slot come from the fixture now**, defaulting to the
          junk they were always hardcoded to.
@@ -3674,6 +4091,20 @@ function UnitIsPlayer(unit)
     if unit and Stub.unseen[unit] then return nil end
 
     if unit == "target" then return Stub.target and Stub.target.isPlayer ~= false end
+
+    --[==[ **A nameplate's unit is a mob unless the fixture says otherwise.**
+
+         Everything that was not the target answered *true* here, which is the
+         convenient default for party and raid tokens and the wrong one for a
+         plate: the plates this addon spends its time on are mobs, and code that
+         asks "is this a player" to decide whether to read its reaction got yes
+         for a boar. A test for that code would have proved nothing.
+
+         Keyed off the plate's own entry, so a fixture can still say a plate
+         belongs to a player and get the other branch. ]==]
+    local plate = Stub.PlateUnit and Stub.PlateUnit(unit)
+    if plate then return plate.isPlayer and 1 or nil end
+
     return true
 end
 
@@ -3751,7 +4182,16 @@ for i = 1, 7 do
          auto-faked because GetFont answering nil makes the restore path a
          no-op, and a no-op restore looks exactly like a working one. ]]--
     f.font, f.fontSize, f.fontFlags = "Fonts/FRIZQT__.TTF", 12, nil
+    --[[ The same rule as the other factory above: a bad size or path leaves
+         the string with no font object rather than its previous one. ]]--
     f.SetFont = function(self, path, size, flags)
+        if type(path) ~= "string" or path == ""
+                or type(size) ~= "number" or size <= 0
+                or (Stub.missingFonts and Stub.missingFonts[path]) then
+            self.font, self.fontSize, self.fontFlags = nil, nil, nil
+            return
+        end
+
         self.font, self.fontSize, self.fontFlags = path, size, flags
     end
     f.GetFont = function(self) return self.font, self.fontSize, self.fontFlags end
@@ -3975,7 +4415,25 @@ function HideUIPanel(frame) if frame and frame.Hide then frame:Hide() end end
 
 Stub.reaction = 4
 
-function UnitReaction(unit, other) return Stub.reaction end
+--[==[ **One reaction for every unit in the world, which is not a world.**
+
+     This answered `Stub.reaction` whatever it was asked about, so a nameplate
+     and the target and a party member all felt the same way about you. The
+     question a nameplate now asks -- *has this yellow mob turned on me* -- is
+     one this could not express at all: there was nothing to set for one mob
+     that did not also set it for every other.
+
+     `Stub.reactions[unit]` is the per-unit answer where a fixture gives one,
+     and `Stub.reaction` stays as the world's default so every test written
+     before this reads the same. ]==]
+Stub.reactions = {}
+
+function UnitReaction(unit, other)
+    local own = Stub.reactions[unit]
+    if own ~= nil then return own end
+
+    return Stub.reaction
+end
 
 --[[ **Targeting by name, which succeeds or quietly does not.**
 
@@ -4329,6 +4787,31 @@ Stub.boundTo = {}
 Stub.bindingsSaved = 0
 
 function GetBindingKey(command) return Stub.bindings[command] end
+--[==[ **Zooming the camera**, which nothing modelled.
+
+     1.12 exposes no zoom-*speed* CVar; what it exposes is `CameraZoomIn(step)`
+     and `CameraZoomOut(step)`, taking however far to move as an argument. That
+     is the whole mechanism behind fine zoom, so a port of it could otherwise be
+     written, bound and shipped without one call ever being made in a test.
+
+     Recorded rather than acted on -- there is no camera here. `Stub.cameraZoom`
+     is the running distance and `Stub.cameraZooms` the calls in order, so a test
+     can ask both "where did it end up" and "was it asked once or twice". ]==]
+Stub.cameraZoom = 0
+Stub.cameraZooms = {}
+
+function CameraZoomIn(step)
+    step = tonumber(step) or 0
+    Stub.cameraZoom = Stub.cameraZoom - step
+    table.insert(Stub.cameraZooms, { dir = "in", step = step })
+end
+
+function CameraZoomOut(step)
+    step = tonumber(step) or 0
+    Stub.cameraZoom = Stub.cameraZoom + step
+    table.insert(Stub.cameraZooms, { dir = "out", step = step })
+end
+
 function GetBindingAction(key) return Stub.boundTo[key] end
 
 function SetBinding(key, command)
@@ -4379,9 +4862,40 @@ end
      nothing. The three Turtle-only micro buttons are left out on purpose: a
      name that is not there is the case a stock client presents, and the sweep
      has to skip it rather than guess. ]]--
+--[==[ **The bag slots are item buttons, and they carry the client's art.**
+
+     They were bare `Button` frames with no template and no textures at all, so
+     nothing could tell the rim from the picture -- and the bag button's test
+     enshrined the wrong one. It asserted that ECO's bag button wore
+     `MainMenuBarBackpackButton:GetNormalTexture()`, which on a real client is
+     `UI-Quickslot2`: **the quickslot rim**. The feature drew a border where a
+     bag should be, reported twice, and passed here both times.
+
+     On every item button in a 1.12 interface the normal texture is the rim and
+     the picture is on `$parentIconTexture`. `ItemButtonTemplate` already builds
+     both regions here, so these buttons are built from it and given what the
+     client gives them. ]==]
+local BAG_SLOT_RING = "Interface\\Buttons\\UI-Quickslot2"
+
 for _, name in ipairs({
     "MainMenuBarBackpackButton", "CharacterBag0Slot", "CharacterBag1Slot",
     "CharacterBag2Slot", "CharacterBag3Slot", "KeyRingButton",
+}) do
+    local b = CreateFrame("Button", name, MainMenuBarArtFrame,
+            "ItemButtonTemplate")
+    b:SetWidth(30)
+    b:SetHeight(30)
+    b:SetPoint("BOTTOMRIGHT", MainMenuBarArtFrame, "BOTTOMRIGHT", 0, 0)
+
+    b:SetNormalTexture(BAG_SLOT_RING)
+end
+
+--[[ The backpack's own picture, which is the one thing on that bar that is not
+     an item's icon. The other four show whatever bag is in them. ]]--
+MainMenuBarBackpackButtonIconTexture:SetTexture(
+        "Interface\\Buttons\\Button-Backpack-Up")
+
+for _, name in ipairs({
     "CharacterMicroButton", "SpellbookMicroButton", "TalentMicroButton",
     "QuestLogMicroButton", "SocialsMicroButton", "WorldMapMicroButton",
     "MainMenuMicroButton", "HelpMicroButton",
@@ -4468,6 +4982,10 @@ end
      Nobody is required to be watching a faction, and the bar has to have
      something sensible to do when nobody is -- so `nil` is the ordinary case,
      not an error state. ]]--
+--[[ Fonts the client cannot load. Empty by default: a build where every font
+     resolves is the ordinary case. ]]--
+Stub.missingFonts = {}
+
 Stub.watchedFaction = nil
 
 function GetWatchedFactionInfo()
@@ -4514,20 +5032,68 @@ function GetPartyLeaderIndex()
     return tonumber(n) or 0
 end
 
+--[==[ **A collapsed header hides its factions from the list entirely.**
+
+     This is the single most surprising thing about 1.12's reputation API and
+     nothing modelled it. `GetNumFactions` does not answer "how many factions
+     has this character"; it answers **how many rows the panel would draw right
+     now** -- and a collapsed header draws one row for itself and none for its
+     children. So a faction the character unquestionably has is simply not
+     reachable by index while its header is shut, and code that walks the list
+     concludes it does not exist.
+
+     Every row stayed visible here, so a walk of the list always found
+     everything and no test could fail on it.
+
+     Set `collapsed = true` on a header in `Stub.factions` to shut it. Children
+     are the rows that follow a header until the next one. ]==]
+local function factionRows()
+    local rows = {}
+    local hidden = false
+
+    for i = 1, table.getn(Stub.factions) do
+        local f = Stub.factions[i]
+
+        if f.header then
+            hidden = f.collapsed and true or false
+            table.insert(rows, f)
+        elseif not hidden then
+            table.insert(rows, f)
+        end
+    end
+
+    return rows
+end
+
 function GetNumFactions()
-    return table.getn(Stub.factions)
+    return table.getn(factionRows())
 end
 
 function GetFactionInfo(index)
-    local f = Stub.factions[index]
+    local f = factionRows()[index]
     if not f then return nil end
 
     if f.header then
-        return f.name, "", nil, nil, nil, nil, nil, nil, 1
+        return f.name, "", nil, nil, nil, nil, nil, nil, 1,
+                f.collapsed and 1 or nil
     end
 
     return f.name, "", f.standing, f.min, f.max, f.value,
-            nil, nil, nil
+            nil, nil, nil, nil
+end
+
+--[[ The two calls that open and shut a header. They take the index *as the list
+     currently reads*, which is why expanding one renumbers everything after it
+     -- the reason anything doing this has to rescan rather than carry on
+     through a loop. ]]--
+function ExpandFactionHeader(index)
+    local f = factionRows()[index]
+    if f and f.header then f.collapsed = nil end
+end
+
+function CollapseFactionHeader(index)
+    local f = factionRows()[index]
+    if f and f.header then f.collapsed = true end
 end
 
 --[[ The line the client prints when reputation changes. Absent, so nothing
@@ -4565,6 +5131,19 @@ for _, family in ipairs({ { "ActionButton", 12 }, { "BonusActionButton", 12 },
     for i = 1, family[2] do
         local button = CreateFrame("Button", family[1] .. i,
                 _G[BUTTON_PARENT[family[1]]])
+
+        --[==[ **Its number within its own bar, which the client's XML gives it
+             and this left at nought.**
+
+             `ActionButton_GetPagedID` is `GetID()` plus a page offset, so a
+             button with no id resolves to the page's first slot minus one --
+             the same answer for all twelve of them. Every test that asked which
+             action a key fires got nought, which is indistinguishable from the
+             right answer being wrong in exactly the way the addon was wrong.
+
+             One to twelve per bar, one to ten for the stance and pet bars,
+             exactly as `ActionBarFrame.xml` numbers them. ]==]
+        button:SetID(i)
 
         button:SetWidth(36)
         button:SetHeight(36)
@@ -5059,6 +5638,150 @@ end
      round on purpose: a stub that numbered them 1, 2, 3 would let that bug
      through, which is exactly how the square minimap passed its test while
      being broken. ]]--
+--[==[ **The two functions a keybinding actually calls.**
+
+     1.12's `Bindings.xml` points `ACTIONBUTTON1` at `ActionButtonDown(1)` on
+     the way down and `ActionButtonUp(1)` on the way up, and the multibars at
+     `MultiActionButtonDown(bar, id)` / `...Up`. The click happens on the *up*,
+     and only if the down half armed it -- which is why a binding that fires
+     only one half does nothing at all.
+
+     Modelled because nothing here modelled them, so "the key still reaches the
+     spell" was untestable while this addon re-parents every action button onto
+     a container of its own.
+
+     The bar numbering is the client's and is the part people get wrong:
+     1 is BottomLeft, 2 is BottomRight, 3 is Right, 4 is Left. ]==]
+--[==[ **The page each bar's slots live on, and how a button finds its slot.**
+
+     Copied from the client's own `Interface\FrameXML\ActionButton.lua` and
+     `MultiActionBars.lua`, read out of patch-4.mpq. The numbers are not
+     arbitrary and cannot be derived: bottom-left is page **6**, bottom-right
+     **5**, left **4**, right **3**.
+
+     `ActionButton_GetPagedID` is the important one, and the shape of it is the
+     whole bug it exists here to catch: **it identifies a button's bar by the
+     NAME OF ITS PARENT FRAME.** An addon that re-parents action buttons onto
+     containers of its own -- which this one does -- silently drops every
+     multibar button into the last branch, where it resolves to the main bar's
+     slot instead of its own.
+
+     None of this was modelled, so the slot a keybind fires had never been
+     computed here at all. ]==]
+CURRENT_ACTIONBAR_PAGE = 1
+NUM_ACTIONBAR_BUTTONS = 12
+NUM_ACTIONBAR_PAGES = 6
+
+BOTTOMLEFT_ACTIONBAR_PAGE = 6
+BOTTOMRIGHT_ACTIONBAR_PAGE = 5
+LEFT_ACTIONBAR_PAGE = 4
+RIGHT_ACTIONBAR_PAGE = 3
+
+function ActionButton_GetPagedID(button)
+    button = button or this
+    if not button then return nil end
+
+    local parent = button.GetParent and button:GetParent()
+    local parentName = parent and parent.GetName and parent:GetName() or ""
+    local id = (button.GetID and button:GetID()) or 0
+
+    if parentName == "MultiBarBottomLeft" then
+        return id + ((BOTTOMLEFT_ACTIONBAR_PAGE - 1) * NUM_ACTIONBAR_BUTTONS)
+    elseif parentName == "MultiBarBottomRight" then
+        return id + ((BOTTOMRIGHT_ACTIONBAR_PAGE - 1) * NUM_ACTIONBAR_BUTTONS)
+    elseif parentName == "MultiBarLeft" then
+        return id + ((LEFT_ACTIONBAR_PAGE - 1) * NUM_ACTIONBAR_BUTTONS)
+    elseif parentName == "MultiBarRight" then
+        return id + ((RIGHT_ACTIONBAR_PAGE - 1) * NUM_ACTIONBAR_BUTTONS)
+    end
+
+    return id + ((CURRENT_ACTIONBAR_PAGE - 1) * NUM_ACTIONBAR_BUTTONS)
+end
+
+--[[ What writes the answer onto the button. `MultiActionButtonUp` casts
+     `button.action`, not a freshly computed slot, so the moment this runs after
+     a re-parent the wrong number is baked in. ]]--
+function ActionButton_UpdateAction(button)
+    button = button or this
+    if not button then return end
+
+    button.action = ActionButton_GetPagedID(button)
+end
+
+--[==[ **Which slot was used, recorded by wrapping rather than replacing.**
+
+     `UseAction`, `HasAction` and `GetActionTexture` are modelled properly a few
+     thousand lines above this, against `Stub.actionBar`. Defining them again
+     here replaced that model with one that knew nothing, and the first thing to
+     ask an action for its icon got nil -- which is what a stub re-declaring a
+     global it has already written looks like: a file that loads clean and a
+     client that has quietly lost a feature.
+
+     So this wraps. The slot a keybind fired is the question being added, and
+     everything else still answers as it did. ]==]
+Stub.usedActions = {}
+
+do
+    local realUseAction = UseAction
+
+    UseAction = function(slot, checkCursor, onSelf)
+        table.insert(Stub.usedActions,
+                { slot = slot, cursor = checkCursor, onSelf = onSelf })
+
+        if realUseAction then return realUseAction(slot, checkCursor, onSelf) end
+    end
+end
+
+if type(IsCurrentAction) ~= "function" then
+    function IsCurrentAction(slot) return nil end
+end
+
+--[==[ **The bar is named, not numbered.**
+
+     `Bindings.xml` reads `MultiActionButtonDown("MultiBarBottomLeft", 1)` --
+     the client passes the **frame name**. Modelled with a number first time
+     round, which is a stub inventing an API, and the kind of thing that makes a
+     passing test mean nothing. ]==]
+function MultiActionButtonDown(bar, id)
+    local button = _G[tostring(bar) .. "Button" .. tostring(id)]
+    if not button then return end
+
+    if button:GetButtonState() == "NORMAL" then
+        button:SetButtonState("PUSHED")
+    end
+end
+
+function MultiActionButtonUp(bar, id, onSelf)
+    local button = _G[tostring(bar) .. "Button" .. tostring(id)]
+    if not button then return end
+
+    if button:GetButtonState() == "PUSHED" then
+        button:SetButtonState("NORMAL")
+        UseAction(button.action, 0, onSelf)
+        button:Click()
+    end
+end
+
+function ActionButtonDown(id)
+    local button = _G["ActionButton" .. tostring(id)]
+    if not button then return end
+
+    if button:GetButtonState() == "NORMAL" then
+        button:SetButtonState("PUSHED")
+    end
+end
+
+function ActionButtonUp(id, onSelf)
+    local button = _G["ActionButton" .. tostring(id)]
+    if not button then return end
+
+    if button:GetButtonState() == "PUSHED" then
+        button:SetButtonState("NORMAL")
+        UseAction(button.action, 0, onSelf)
+        button:Click()
+    end
+end
+
 MAX_CONTAINER_ITEMS = 20
 
 for bag = 1, 2 do
@@ -5240,13 +5963,23 @@ end
      something else -- and picking up a locked item does nothing. Code that
      checked and code that did not looked identical here, so a mover that retried
      a locked slot for ever would have passed. ]==]
+--[==[ **The icon comes from the fixture now.**
+
+     Every item in every bag answered with the same bone, so nothing that reads
+     an item's art could be tested: a lookup that returned the *wrong* item's
+     icon and one that returned the right one were the same string. That matters
+     the moment anything indexes items by their picture -- which the cast bar now
+     does, because an item cast is announced by name with no icon attached.
+
+     The bone stays as the default, so every existing fixture keeps answering
+     exactly what it did. ]==]
 function GetContainerItemInfo(bag, slot)
     local b = Stub.bags[bag]
     local item = b and b[slot]
     if not item then return nil end
 
-    return "Interface\\Icons\\INV_Misc_Bone_01", item.count or 1,
-            item.locked or nil
+    return item.texture or "Interface\\Icons\\INV_Misc_Bone_01",
+            item.count or 1, item.locked or nil
 end
 
 function UseContainerItem(bag, slot)
@@ -5570,6 +6303,45 @@ SPELLCASTOTHERSTART = "%s begins to cast %s."
      round the wrong way ends the interrupter's cast instead. ]]--
 UNITDIESOTHER = "%s dies."
 UNITDESTROYEDOTHER = "%s is destroyed."
+
+--[==[ **The other three ways the client says something died**, which were
+     absent -- and the absence hid a real bug in the one that matters most.
+
+     `SELFKILLOTHER` is what the client prints for **anything you kill
+     yourself**, which is most of what anybody kills. Nothing here produced that
+     sentence, so a cast bar that only stopped on "%s dies." passed, and in game
+     a mob you killed kept casting until it timed out.
+
+     The dead one is named **first** in both two-name sentences. Reading the
+     second forgets the killer instead, which is a unit that is very much alive
+     and usually the player.
+
+     Spelled as the client's own `GlobalStrings.lua` spells them. ]==]
+--[==[ **The sentences that announce an aura, which were absent entirely.**
+
+     `modules/auras.lua` begins its reader with `if not AURAADDEDOTHERHARMFUL
+     then return nil end`, so with these missing **the whole combat-log aura path
+     was dead code here**. Every aura test drives `AddAura` and `NoteAura` by
+     hand, and the thing that actually calls them in game had never run once.
+
+     That is how a belief written into the tests -- that a line arriving on
+     `CHAT_MSG_SPELL_PERIODIC_*_DAMAGE` is a *tick* -- went unchecked. Both
+     sentences arrive on those channels, but the reader only ever matches "is
+     afflicted by", which no tick line can. So the lines reaching `AddAura` are
+     applications, every one of them, and the guard that stopped them restarting
+     the clock was guarding the wrong path.
+
+     Spelled as the client's own `GlobalStrings.lua` spells them. ]==]
+AURAADDEDOTHERHARMFUL = "%s is afflicted by %s."
+AURAADDEDSELFHARMFUL = "You are afflicted by %s."
+AURAREMOVEDOTHER = "%s fades from %s."
+
+PERIODICAURADAMAGESELFOTHER = "%s suffers %d %s damage from your %s."
+PERIODICAURADAMAGEOTHEROTHER = "%s suffers %d %s damage from %s's %s."
+
+SELFKILLOTHER = "You have slain %s!"
+PARTYKILLOTHER = "%s is slain by %s!"
+INSTAKILLOTHER = "%s is killed by %s."
 SPELLINTERRUPTOTHEROTHER = "%s interrupts %s's %s."
 SPELLINTERRUPTSELFOTHER = "You interrupt %s's %s."
 SPELLPERFORMOTHERSTART = "%s begins to perform %s."
@@ -5760,12 +6532,15 @@ NUM_CONTAINER_FRAMES = 12
 --[[ The menu bar's bag buttons, which draw pressed in while a bag is open. The
      client keeps them in step from `ContainerFrame_OnHide`; an addon that stops
      those frames ever showing has to keep them in step itself. ]]--
-MainMenuBarBackpackButton = CreateFrame("Button", "MainMenuBarBackpackButton",
-        UIParent)
+--[==[ **Not built again here.**
 
-for i = 0, 3 do
-    CreateFrame("Button", "CharacterBag" .. i .. "Slot", UIParent)
-end
+     These six were created a few thousand lines up, with the main bar's art
+     frame for a parent and the client's slot textures on them -- and this block
+     replaced two of them with bare frames under `UIParent`, throwing both away.
+     The second one won, so the art above was never the art a test saw.
+
+     A stub that builds the same global twice has two answers to "what is this
+     frame", and which one a test gets depends on file order. ]==]
 
 PutItemInBackpack = records("PutItemInBackpack")
 PutItemInBag = records("PutItemInBag")
@@ -5968,6 +6743,34 @@ for i = 1, 4 do
 
     icon:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+    --[==[ **The three buttons, with the client's own names and own clicks.**
+
+         Only the icon was modelled, so nothing could be tested about the
+         controls people actually press. The names are the client's, out of
+         `Interface\FrameXML\LootFrame.xml`, and the Need button is the one that
+         catches people out: it is `$parentRollButton`, not `NeedButton`.
+
+         Each one's `OnClick` is the client's line verbatim --
+         `RollOnLoot(this:GetParent().rollID, n)` -- which also pins the second
+         thing worth having here: the roll id is a **field on the frame**, not
+         its `GetID`. Code reading the wrong one works against a stub that sets
+         both and fails in game. ]==]
+    local function rollButton(suffix, choice)
+        local b = CreateFrame("Button", name .. suffix, frame)
+        b:SetWidth(32)
+        b:SetHeight(32)
+
+        b:SetScript("OnClick", function()
+            RollOnLoot(this:GetParent().rollID, choice)
+        end)
+
+        return b
+    end
+
+    rollButton("RollButton", 1)
+    rollButton("GreedButton", 2)
+    rollButton("PassButton", 0)
+
     _G[name .. "Name"] = newFontString(frame, "OVERLAY", "GameFontNormal")
 end
 
@@ -5977,6 +6780,11 @@ function Stub.ShowLootRoll(index, rollID)
     if not frame then return nil end
 
     frame:SetID(rollID)
+
+    --[[ And on the frame, which is where the client's own buttons read it
+         from. See `rollButton`. ]]--
+    frame.rollID = rollID
+
     frame:Show()
 
     local roll = Stub.lootRolls[rollID]
@@ -6727,7 +7535,24 @@ function LoadAddOn(name) return nil end
      further up, and redefining it here to answer the player's level for every
      unit is exactly the kind of quiet shadowing that makes a stub agree with a
      bug. ]]--
-function UnitRace(unit) return "Human", "Human" end
+--[==[ **The race, and both of the things the client answers with.**
+
+     This returned `"Human", "Human"` whoever asked, so nothing that reads a
+     race could be tested and nothing that *mis*-reads one could fail. The two
+     returns are not the same string: the first is localised for display, the
+     second is the token -- and 1.12's token for the Forsaken is **`Scourge`**,
+     which is the spelling no data file in this addon uses.
+
+     Set `Stub.player.race` to a pair to model a build whose two answers differ,
+     or to a plain string for one where they do not. ]==]
+function UnitRace(unit)
+    local race = Stub.player and Stub.player.race
+
+    if type(race) == "table" then return race[1], race[2] or race[1] end
+    if type(race) == "string" then return race, race end
+
+    return "Human", "Human"
+end
 function UnitFactionGroup(unit) return "Alliance", "Alliance" end
 function UnitSex(unit) return 2 end
 

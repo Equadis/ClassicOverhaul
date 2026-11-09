@@ -14,7 +14,7 @@ local M = OB.RegisterModule({
     name = "Combo Points",
     bar = "extras",
     priority = 10,
-    classes = { ROGUE = true, DRUID = true },
+    classes = OB.comboClasses,
     renders = "segments",
     segments = 5,
     tickly = false,
@@ -30,6 +30,14 @@ local M = OB.RegisterModule({
         },
         dim = 0.3,
         hideWhenZero = false,
+
+        --[==[ **On.** Points survive the end of a fight, so out of combat this
+             row is reporting the last pull. Asked for directly on 2026-09-24,
+             alongside restricting the whole feature to rogues.
+
+             Named to match the threat window's switch and phrased as *hide*
+             like the bars' own `hideOOC`. ]==]
+        hideOutOfCombat = true,
     },
 
     options = {
@@ -40,11 +48,17 @@ local M = OB.RegisterModule({
         { "Point 5 Color", "colors.5", "color", true },
         { "Inactive Opacity", "dim", "slider", 0, 100, 5, 0.01 },
         { "Hide At Zero Points", "hideWhenZero", "boolean" },
+        { "Hide Out Of Combat", "hideOutOfCombat", "boolean" },
     },
 
     requires = { "GetComboPoints" },
 
-    events = { "PLAYER_COMBO_POINTS", "PLAYER_ENTERING_WORLD", "PLAYER_TARGET_CHANGED" },
+    --[[ The two regen events are the core's combat state. Listed here as well
+         so leaving a fight redraws this bar at once rather than whenever the
+         next point happens to land -- the same way the threat window takes
+         `PLAYER_REGEN_ENABLED`. ]]--
+    events = { "PLAYER_COMBO_POINTS", "PLAYER_ENTERING_WORLD", "PLAYER_TARGET_CHANGED",
+               "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED" },
 })
 
 function M:Config()
@@ -77,6 +91,11 @@ function M:OnDraw()
     local count = self:GetValue()
 
     if cfg.hideWhenZero and count == 0 then
+        OB.SetBarShown(self, false)
+        return
+    end
+
+    if cfg.hideOutOfCombat ~= false and not OB.inCombat and not OB.testMode then
         OB.SetBarShown(self, false)
         return
     end

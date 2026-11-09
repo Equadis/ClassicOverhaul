@@ -216,6 +216,76 @@ OB.parser.events = {
 }
 
 -- ---------------------------------------------------------------------------
+-- the sentences that say something died
+-- ---------------------------------------------------------------------------
+
+--[==[ **Death is the one thing a 1.12 interface has to read out of English.**
+
+     Nothing announces that a creature is gone. There is no `UNIT_DIED`, no
+     GUID in the combat log, and a nameplate carries no unit token -- so the
+     only notice anything gets is a sentence in the combat channel, and whoever
+     needs to know has to read it.
+
+     Two things in this addon need to: a cast bar has to stop when its caster
+     dies, and a debuff has to be forgotten when the thing wearing it does.
+     `casts.lua` had its own copy of two of these five, which is the start of
+     the drift this file exists to prevent.
+
+     **Which name died differs by sentence**, so each carries the capture it
+     lives in. "%s dies." has one name. "%s is slain by %s!" names the dead
+     first and the killer second, and reading the second one forgets the wrong
+     unit entirely.
+
+     All five are the client's own, verified against its `GlobalStrings.lua`:
+
+         UNITDIESOTHER        "%s dies."
+         UNITDESTROYEDOTHER   "%s is destroyed."
+         SELFKILLOTHER        "You have slain %s!"
+         PARTYKILLOTHER       "%s is slain by %s!"
+         INSTAKILLOTHER       "%s is killed by %s."
+
+     The third matters more than it looks: **"You have slain %s!" is what the
+     client prints for anything you kill yourself**, which is most of what
+     anybody kills. `casts.lua` read only the first two, so a mob you killed
+     kept its cast bar until it timed out -- the same bug that file was written
+     to fix, surviving in the most common case of all. ]==]
+OB.parser.deaths = {
+    { "UNITDIESOTHER", 1 },
+    { "UNITDESTROYEDOTHER", 1 },
+    { "SELFKILLOTHER", 1 },
+    { "PARTYKILLOTHER", 1 },
+    { "INSTAKILLOTHER", 1 },
+}
+
+--[[ Both channels, because a death worth hearing about may be on either side:
+     a mob you were fighting, or a player whose debuffs you put there. ]]--
+OB.parser.deathEvents = {
+    "CHAT_MSG_COMBAT_HOSTILE_DEATH",
+    "CHAT_MSG_COMBAT_FRIENDLY_DEATH",
+}
+
+--[[ Who died, or nothing when this line is not about a death. Through the
+     client's own sentences rather than by matching English, the same rule every
+     parsed line in this addon follows -- a client that lacks one of them simply
+     never matches it, rather than breaking the rest. ]]--
+function OB.ReadDeathLine(text)
+    if not text then return nil end
+
+    for i = 1, table.getn(OB.parser.deaths) do
+        local sentence = getglobal(OB.parser.deaths[i][1])
+
+        if sentence then
+            local first, second = OB.ParseLine(text, sentence)
+            local who = (OB.parser.deaths[i][2] == 2) and second or first
+
+            if who then return who end
+        end
+    end
+
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- what each sentence means
 -- ---------------------------------------------------------------------------
 

@@ -817,7 +817,7 @@ function M:ItemFamily(link)
 
     if type(GetItemInfo) ~= "function" then return 0 end
 
-    local name, _, _, _, class, subclass = GetItemInfo(link)
+    local name, _, _, _, class, subclass = GetItemInfo(OB.ItemQuery(link))
     local key = tostring(class or "") .. "/" .. tostring(subclass or "")
     local family = ITEM_KINDS[key] or 0
 
@@ -844,7 +844,7 @@ function M:BagFamily(id)
 
     if type(GetItemInfo) ~= "function" then return 0 end
 
-    local _, _, _, _, _, subclass = GetItemInfo(link)
+    local _, _, _, _, _, subclass = GetItemInfo(OB.ItemQuery(link))
     return BAG_KINDS[tostring(subclass or "")] or 0
 end
 
@@ -1662,7 +1662,7 @@ end
 function M:MaxStack(link)
     if type(GetItemInfo) ~= "function" or not link then return 1 end
 
-    local _, _, _, _, _, _, stack = GetItemInfo(link)
+    local _, _, _, _, _, _, stack = GetItemInfo(OB.ItemQuery(link))
     return tonumber(stack) or 1
 end
 
@@ -1706,21 +1706,57 @@ local function slotKey(row)
     return tostring(row.bag) .. ":" .. tostring(row.slot)
 end
 
---[[ One pickup and one drop, and both slots remembered as in flight.
-     Whatever is on the cursor would be dropped into the first slot touched
-     instead of the item we meant, so it is put back first. ]]--
+--[==[ **One pickup and one drop, and the cursor is asked between them.**
+
+     A move was issued blind: pick up, put down, count it, move on. Neither
+     half answers anything, so nothing here could tell a move that happened
+     from one the client ignored -- and the run inferred it afterwards, by
+     comparing the bags before and after and calling "nothing changed" a
+     refusal. That inference is what filled the chat with *the client
+     refused a move*: it fires the same way for a move that was refused, a
+     move that has not landed yet, and a pass whose moves cancelled out.
+
+     The cursor is the witness, and it is exact. After the pickup, an empty
+     cursor means the client would not lift that slot -- and the drop that
+     followed would then have *picked up the goal instead*, which is how one
+     ignored move turned into an item wandering about the bags. After the
+     drop, a full cursor means the client would not put it there: a quiver
+     that will not take a bandage, a bag that filled up since the pass was
+     planned. Answers what happened, so the caller can skip that pair rather
+     than end the run for everybody.
+
+     Whatever is already on the cursor would be dropped into the first slot
+     touched instead of the item we meant, so it is put back first. ]==]
+local MOVE_OK, MOVE_STUCK, MOVE_REFUSED = "moved", "stuck", "refused"
+
 function M:Move(from, to)
     if type(ClearCursor) == "function" then ClearCursor() end
 
+    local watching = type(CursorHasItem) == "function"
+
     PickupContainerItem(from.bag, from.slot)
+
+    --[[ Nothing lifted: the slot is in flight or the client will not have
+         it. Nothing is dropped, so nothing is left in the wrong place. ]]--
+    if watching and not CursorHasItem() then return MOVE_STUCK end
+
     PickupContainerItem(to.bag, to.slot)
+
+    --[[ Still holding it: the goal would not take it. Put it back where it
+         came from rather than leaving it on the cursor, where the next
+         click in the world would throw it. ]]--
+    if watching and CursorHasItem() then
+        PickupContainerItem(from.bag, from.slot)
+        if type(ClearCursor) == "function" then ClearCursor() end
+        return MOVE_REFUSED
+    end
 
     self.touched = self.touched or {}
     self.touched[slotKey(from)] = true
     self.touched[slotKey(to)] = true
     self.sortMoves = (self.sortMoves or 0) + 1
 
-    return true
+    return MOVE_OK
 end
 
 --[[ A slot this pass may touch: not moved already this pass, and not in
@@ -1775,8 +1811,13 @@ function M:CleanStep()
             local to = table.remove(list, 1)
             local from = table.remove(list)
 
-            self:Move(from, to)
-            moved = true
+            local answer = self:Move(from, to)
+
+            if answer == MOVE_OK then
+                moved = true
+            elseif answer == MOVE_STUCK then
+                blocked = true
+            end
         end
 
         --[[ One pile left over with a partner in flight is a merge to come
@@ -1821,7 +1862,7 @@ function M:RowQuality(row)
     if not row or not row.link then return 0 end
 
     if type(GetItemInfo) == "function" then
-        local _, _, quality = GetItemInfo(row.link)
+        local _, _, quality = GetItemInfo(OB.ItemQuery(row.link))
         if quality then return quality end
     end
 
@@ -1863,8 +1904,111 @@ end
      Descending throughout, which looks odd written down and is correct: it puts
      the best of a kind at the front of its kind, which is the order somebody
      scanning a bag is actually reading in. ]==]
+--[==[ **The order a sorted bag reads in, and why it needed one at all.**
+
+     Ollie, 2026-10-15: *"bag sorting still need fixing"*. The engine was right
+     -- a realistic three-bag run finishes in five passes, thirteen moves,
+     nothing refused, stacks merged and the bags packed. What came out the other
+     end was this:
+
+         Weapon, Trade Goods, Recipe, Quest, Projectile, Miscellaneous, Key,
+         Container, Consumable, Armor
+
+     Which is the alphabet, backwards. An epic helm sorted **behind vendor
+     trash**; potions second to last; junk in the middle of the bag.
+
+     **The cause is one word in the port.** Bagnon's `Sort.Proprieties` compares
+     `class` descending and that is correct on retail, where `class` is a
+     *numeric class id* -- Container 1, Weapon 2, Armor 4 -- so the number
+     carries the grouping. 1.12's `GetItemInfo` answers a **localized name**
+     instead, the compare went with it unchanged, and the ordering became
+     alphabetical. In German or French it would be a different nonsense.
+
+     So the names are ranked explicitly, and the ranking is **read off the
+     client** rather than written out in English: `GetAuctionItemClasses`
+     returns the ten classes in a fixed order in whatever language the client
+     speaks, so position 1 is Weapon and position 10 is Miscellaneous no matter
+     what they are called. Quest comes from the auction category the item
+     database already reads for the same reason. Anything else -- Key, or a
+     class a fork has added -- lands just above junk, which is where an unknown
+     thing belongs: findable, and not in front of your gear. ]==]
+local CLASS_ORDER = {
+    "Container", "Weapon", "Armor", "Consumable", "Reagent",
+    "Trade Goods", "Recipe", "Projectile", "Quiver",
+    "Quest", "Key", "Miscellaneous",
+}
+
+--[[ The order `GetAuctionItemClasses` answers in, which is the client's and is
+     the same in every locale. Position is the whole of what it tells us. ]]--
+local AUCTION_CLASS_ORDER = {
+    "Weapon", "Armor", "Container", "Consumable", "Trade Goods",
+    "Projectile", "Quiver", "Recipe", "Reagent", "Miscellaneous",
+}
+
+--[[ Unknown sits one above junk rather than at either extreme: a class this
+     table has never heard of is not trash, and it is not your weapon. ]]--
+local UNKNOWN_KIND_RANK = table.getn(CLASS_ORDER) - 1
+
+function M:ClassRanks()
+    if self.classRanks then return self.classRanks end
+
+    local rank = {}
+    for i = 1, table.getn(CLASS_ORDER) do rank[CLASS_ORDER[i]] = i end
+
+    local out = {}
+
+    if type(GetAuctionItemClasses) == "function" then
+        local names = { GetAuctionItemClasses() }
+
+        for i = 1, table.getn(AUCTION_CLASS_ORDER) do
+            local localized = names[i]
+            local canonical = AUCTION_CLASS_ORDER[i]
+
+            if type(localized) == "string" and localized ~= "" then
+                out[localized] = rank[canonical]
+            end
+        end
+    end
+
+    --[[ Not in the auction house's list, and the one class anybody notices
+         sitting in the wrong place. Asked of the item database, which worked
+         out where the client keeps that name a while ago. ]]--
+    local db = OB.modules and OB.modules.itemdatabase
+
+    if db and type(db.QuestItemClass) == "function" then
+        local quest = db.QuestItemClass()
+        if type(quest) == "string" and quest ~= "" then
+            out[quest] = rank["Quest"]
+        end
+    end
+
+    --[[ The English names as well, always. A client that answers nothing above
+         still sorts, and every fixture and every test reads the same table. ]]--
+    for i = 1, table.getn(CLASS_ORDER) do
+        if out[CLASS_ORDER[i]] == nil then out[CLASS_ORDER[i]] = i end
+    end
+
+    self.classRanks = out
+    return out
+end
+
+--[==[ **How early this class sorts, as a number that is bigger when it is
+     earlier.**
+
+     Every key below is compared descending -- that is Bagnon's shape and it is
+     right for quality, where the best of a kind belongs at the front of its
+     kind. Rather than give one key its own direction and leave a reader to
+     notice, the rank is stored counted from the bottom, so "bigger is earlier"
+     is true of this key the same as the rest. ]==]
+function M:ClassKind(class)
+    local ranks = self:ClassRanks()
+    local place = ranks[tostring(class or "")] or UNKNOWN_KIND_RANK
+
+    return (table.getn(CLASS_ORDER) + 1) - place
+end
+
 function M:SortKeys(row)
-    local keys = { class = "", subclass = "", equip = "", texture = "",
+    local keys = { kind = 0, subclass = "", equip = "", texture = "",
                    quality = 0, level = 0, id = 0, count = 0 }
 
     if not row or row.empty or not row.link then return keys end
@@ -1876,11 +2020,17 @@ function M:SortKeys(row)
 
     if type(GetItemInfo) == "function" then
         local _, _, quality, level, class, subclass, _, equip =
-                GetItemInfo(row.link)
+                GetItemInfo(OB.ItemQuery(row.link))
 
         keys.quality = tonumber(quality) or keys.quality
+
+        --[[ The fourth return is `minLevel` on 1.12. There is no item level on
+             this client at all, so the thing being compared is what the item
+             *requires* -- which is the closest stand-in available and is what
+             the button now says. ]]--
         keys.level = tonumber(level) or 0
-        keys.class = tostring(class or "")
+
+        keys.kind = self:ClassKind(class)
         keys.subclass = tostring(subclass or "")
         keys.equip = tostring(equip or "")
     end
@@ -1888,8 +2038,16 @@ function M:SortKeys(row)
     return keys
 end
 
-local SORT_KEYS = { "class", "subclass", "equip", "quality",
-                    "texture", "level", "id", "count" }
+--[==[ **Kind first, then how it groups, then how good it is.**
+
+     Two changes from the straight port. `class` is `kind`, a rank rather than a
+     name -- see `ClassKind`. And `texture` has moved below `id`: it sat above
+     `level`, so two epics of one kind were ordered by the **filename of their
+     icon** rather than by their level, which is not what the button promised
+     and is not anything. It is a last-ditch tie-break between items that are
+     otherwise identical, which is all an icon path can honestly be. ]==]
+local SORT_KEYS = { "kind", "subclass", "equip", "quality",
+                    "level", "id", "texture", "count" }
 
 --[[ Keys are read once per row and hung on it, not once per comparison. A sort
      of a hundred and sixty slots is something like twelve hundred comparisons,
@@ -2045,16 +2203,31 @@ function M:SortStep()
                      to live where the wanted item came from -- or the swap
                      trades one misplaced item for another the client will
                      refuse. ]]--
-                if not self:SlotFree(goal) or not self:SlotFree(cur) then
+                local pairKey = slotKey(cur) .. ">" .. slotKey(goal)
+
+                if self.refused and self.refused[pairKey] then
+                    --[[ Asked once and refused: the client will refuse it
+                         again, and asking on every pass is the loop this
+                         engine exists to avoid. ]]--
+                elseif not self:SlotFree(goal) or not self:SlotFree(cur) then
                     pending = true
                 elseif not self:FitsIn(displaced, cur.eqFamily) then
                     pending = true
                 else
-                    self:Move(cur, goal)
+                    local answer = self:Move(cur, goal)
 
-                    content[goal], pos[want] = want, goal
-                    content[cur], pos[displaced] = displaced, cur
-                    moved = true
+                    if answer == MOVE_OK then
+                        content[goal], pos[want] = want, goal
+                        content[cur], pos[displaced] = displaced, cur
+                        moved = true
+                    elseif answer == MOVE_REFUSED then
+                        self.refused = self.refused or {}
+                        self.refused[pairKey] = true
+                        self.sortRefused = (self.sortRefused or 0) + 1
+                    else
+                        --[[ Would not lift: in flight, or about to be. ]]--
+                        pending = true
+                    end
                 end
             end
         end
@@ -2072,7 +2245,10 @@ end
      transcription of somebody else's rule, and a bag that comes back
      rearranged looks arbitrary unless you happen to work it out. Said once, on
      both paths -- a bag already in that order was still sorted by something. ]==]
-local SORT_ORDER = "kind, then quality, then item level"
+--[[ Said accurately. It used to promise "item level", which 1.12 does not
+     have -- the fourth return of `GetItemInfo` here is the level the item
+     *requires*. ]]--
+local SORT_ORDER = "kind, then rarity, then required level"
 
 --[==[ **The run: a pass, a wait for it to land, another pass.**
 
@@ -2125,19 +2301,26 @@ function M:SortTicker()
     return ticker
 end
 
---[[ Every slot, what is in it and how many: the bags as one string, so two
-     readings can be compared. ]]--
-function M:Shape()
-    local rows = self:ScanBags()
-    local parts = {}
+--[==[ **What the run did, in one line.**
 
-    for i = 1, table.getn(rows) do
-        local row = rows[i]
-        table.insert(parts, slotKey(row) .. "=" .. tostring(row.link or "")
-                .. "x" .. tostring(row.count or 0))
+     Refused pairs are counted and reported here rather than each time they
+     come round: a quiver that will not take what the order wants in it is a
+     fact about the bags, not an error, and saying so once is the difference
+     between a note and the wall of *the client refused a move* this
+     replaced. ]==]
+function M:SortSummary()
+    if (self.sortMoves or 0) == 0 and (self.sortRefused or 0) == 0 then
+        return "already tidy -- sorted by " .. SORT_ORDER .. "."
     end
 
-    return table.concat(parts, ";")
+    local note = ""
+    if (self.sortRefused or 0) > 0 then
+        note = "  " .. tostring(self.sortRefused)
+                .. " the client would not move."
+    end
+
+    return "sorted: " .. tostring(self.sortMoves or 0) .. " moves in "
+            .. tostring(self.sortPasses or 0) .. " passes." .. note
 end
 
 function M:EndRun(why)
@@ -2152,7 +2335,6 @@ end
      landed: what the bags looked like before it, whether it moved anything,
      and when. ]]--
 function M:RunPass()
-    self.shapeBefore = self:Shape()
     self.bagUpdated = nil
     self.passAt = (type(GetTime) == "function" and GetTime()) or 0
 
@@ -2169,13 +2351,18 @@ function M:Sort()
     self.sortMoves = 0
     self.sortWaits = 0
     self.sortPasses = 0
+    self.sortRefused = 0
     self.touched = {}
+    self.refused = {}
 
     local step = self:RunPass()
 
     if not step then
+        --[[ Through the same summary as a finished run: a first pass whose
+             only action was a refusal said "already tidy", which is the one
+             thing the bags were not. ]]--
         self:EndRun()
-        Say("already tidy -- sorted by " .. SORT_ORDER .. ".")
+        Say(self:SortSummary())
         return true
     end
 
@@ -2230,16 +2417,6 @@ function M:ContinueRun()
 
     if not self:Settled() then return self:Wait() end
 
-    --[[ A pass that moved things and changed nothing was refused by the
-         client. Said, with the first move it asked for, and stopped. ]]--
-    if self.passIssued and self:Shape() == self.shapeBefore then
-        local first
-        for key in pairs(self.touched or {}) do first = first or key end
-
-        return self:EndRun("stopped: the client refused a move"
-                .. (first and (" (slot " .. first .. ")") or "") .. ".")
-    end
-
     local step = self:RunPass()
 
     if step == true then
@@ -2247,8 +2424,7 @@ function M:ContinueRun()
     elseif step == "locked" then
         self:Wait()
     else
-        self:EndRun("sorted: " .. tostring(self.sortMoves or 0) .. " moves in "
-                .. tostring(self.sortPasses or 0) .. " passes.")
+        self:EndRun(self:SortSummary())
     end
 
     return true

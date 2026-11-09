@@ -746,6 +746,52 @@ function M:Active()
     return self.active
 end
 
+--[==[ **Choosing which waypoint the arrow points at.**
+
+     Ollie, 2026-09-29: *"add 'Set as Active Waypoint' should be an option"*.
+
+     `Active` picks the first mark in the zone and keeps it until it is cleared,
+     so with five marks down there was **no way to point at the second one**
+     except deleting the first. The arrow answers "which way now", and which way
+     is a choice the player was not able to make.
+
+     **Only a mark in the zone the player is standing in.** The arrow is drawn
+     from the player's position to a point on this map; a waypoint in another
+     zone has no direction to give, and pointing at one would be a confident
+     arrow at nothing. Refused rather than accepted quietly, so a caller that
+     asks for the impossible learns that it did.
+
+     `arrived` is cleared with it, or the new waypoint opens wearing the arrival
+     state of the old one -- the same reason `ApplyArrow` clears it on hide. ]==]
+function M:SetActive(point)
+    if not point then return false end
+
+    local zone = self:Zone()
+    if not zone then return false end
+
+    local list = self:List(zone)
+    local found = false
+
+    for i = 1, table.getn(list) do
+        if list[i] == point then found = true break end
+    end
+
+    if not found then return false end
+
+    self.active = point
+    self.activeZone = zone
+    self.arrived = nil
+
+    self:ApplyArrow()
+    return true
+end
+
+--[[ Whether a given mark is the one being pointed at, for a menu that should
+     not offer to do what has already been done. ]]--
+function M:IsActive(point)
+    return point ~= nil and self:Active() == point
+end
+
 -- ---------------------------------------------------------------------------
 -- pointing at it
 -- ---------------------------------------------------------------------------
@@ -1374,13 +1420,33 @@ end
      `isTitle` on the first entry is the client's own way of writing a heading
      into a dropdown, and it names the waypoint so a menu opened from the wrong
      pin is obvious before anything is clicked. ]==]
-function M:MenuItems()
-    local point = self:Active()
+--[==[ **The menu is about the mark it was opened on.**
+
+     It used to ask `Active()` whatever it had been opened from, so right-
+     clicking the *third* pin and choosing "Clear This Waypoint" cleared the
+     first -- the menu even named the wrong one in its own title. A map with one
+     mark could not show the difference, which is why it survived.
+
+     The pin carries its point (`pin.point`, set when the pins are laid out), so
+     the opener passes it in. The arrow has none and falls back to the active
+     mark, which is the right answer for the arrow: it is the active one. ]==]
+function M:MenuItems(point)
+    point = point or self:Active()
     local module = self
 
     local items = {
         { text = (point and point.name) or "Waypoint", isTitle = 1, notCheckable = 1 },
     }
+
+    --[[ Offered only when it would do something: on the mark already being
+         pointed at, it is a button that changes nothing. ]]--
+    if point and not self:IsActive(point) then
+        table.insert(items, {
+            text = "Set as Active Waypoint",
+            notCheckable = 1,
+            func = function() module:SetActive(point) end,
+        })
+    end
 
     if point then
         table.insert(items, {
@@ -1420,8 +1486,18 @@ function M:ShowMenu(anchor)
 
     local module = self
 
+    --[[ The pin carries the mark it was drawn for. The arrow carries none, and
+         falls back to the active one inside `MenuItems` -- which is the right
+         answer for the arrow, since the active mark is what it points at.
+
+         Captured here rather than read inside the closure: the dropdown is
+         re-initialised on every open, and by the time it runs `anchor` is the
+         frame this menu was *last* opened from if anything else opened it in
+         between. ]]--
+    local menuPoint = anchor and anchor.point or nil
+
     UIDropDownMenu_Initialize(menu, function()
-        local items = module:MenuItems()
+        local items = module:MenuItems(menuPoint)
 
         for i = 1, table.getn(items) do
             UIDropDownMenu_AddButton(items[i])

@@ -15,7 +15,7 @@
 EquadisClassicOverhaul = {}
 local OB = EquadisClassicOverhaul
 
-OB.version = "0.99.312"
+OB.version = "0.99.359"
 OB.addonName = "Equadis' Classic Overhaul"
 
 --[[ The addon folder name is load-bearing: every media path below hardcodes it,
@@ -250,6 +250,20 @@ local function isLeaf(t)
     return true
 end
 
+--[==[ **Exported, because anything writing a profile has to ask the same
+     question the merge asks.**
+
+     A leaf is *replaced* wholesale, so a table that answers yes has to be
+     written out in full. The starter-profile capture
+     (`.eco-work/make_starter_profile.lua`) writes only what differs from the
+     defaults, and emitting half a colour here means the other half arrives nil
+     -- which is an arithmetic error at the first thing that reads it, and a bar
+     stack missing two of its eight rows.
+
+     Asked through this rather than reimplemented there, because a second copy
+     of the rule is a second answer waiting to disagree with this one. ]==]
+OB.IsLeaf = isLeaf
+
 --[[ Merge `src` over `dst` in place, recursing into structures and replacing
      leaves.
 
@@ -268,6 +282,75 @@ function OB.DeepMerge(dst, src)
             dst[k] = v
         end
     end
+end
+
+--[==[ **Is this thing fighting you**, which is not the same as what faction it
+     is.
+
+     Ollie, 2026-10-24 and again on the 26th: *"yellow enemies turn red when
+     aggrod by you. both nameplate and unitframe"* -- *"this didnt change"*.
+
+     The first attempt read `UnitReaction`, and that was the wrong call. A
+     reaction is a **faction standing** and aggro does not move it: a Mountain
+     Boar you have just pulled is still neutral to you, still 4, still yellow.
+     The client's own `TargetFrame_CheckFaction` paints straight out of
+     `UnitReactionColor[reaction]` and colours it yellow for the whole fight,
+     which is why nothing changed -- there was nothing there to change.
+
+     What does change is who the thing is swinging at. `unit .. "target"` is the
+     one question that answers it, and it is the same one the plate threat
+     colouring has asked since it was written: `targettarget` on a stock client,
+     any unit's target under SuperWoW.
+
+     **Your pet counts.** A boar chewing on a hunter's cat is in a fight with
+     the hunter, and colouring it neutral while it is being shot at reads as the
+     bar being broken. ]==]
+function OB.UnitFightingYou(unit)
+    if not unit then return false end
+    if type(UnitExists) ~= "function" then return false end
+    if type(UnitIsUnit) ~= "function" then return false end
+
+    local its = unit .. "target"
+    if not UnitExists(its) then return false end
+
+    if UnitIsUnit(its, "player") then return true end
+
+    if UnitExists("pet") and UnitIsUnit(its, "pet") then return true end
+
+    return false
+end
+
+--[==[ **What to hand `GetItemInfo`, which will not take a link.**
+
+     Ollie, 2026-10-23, `/eq comparedebug` while hovering a pair of boots:
+
+         item under the cursor: [Loose Chain Boots]
+         equip slot from GetItemInfo: nil
+
+     A real link, a common item, its tooltip on screen -- and nothing came back.
+     The same for a Mining Pick. Not a caching problem: this client will not
+     take a **decorated hyperlink**, the `|cff...|Hitem:2385:0:0:0|h[Name]|h|r`
+     shape that `GetContainerItemLink` and `GameTooltip:GetItem` hand out.
+
+     The client's own code never passes one. `ContainerFrame.lua` calls
+     `GetItemInfo(tonumber(id))`, `MerchantFrame.lua` `GetItemInfo(id or 0)`,
+     and aux passes a bare item string. Every call in this addon that passed an
+     id has always worked -- the item database -- and every call that passed a
+     link is a feature that has been reported broken: shift to compare three
+     times, and the bag sort's stacking six, because `maxStack` came back nil
+     and nothing could ever be merged.
+
+     So the id is dug out and that is what gets asked. A string with no id in it
+     is handed on unchanged, because a name is what some callers have and
+     answering nothing here would be a second bug on top of the first. ]==]
+function OB.ItemQuery(item)
+    if type(item) == "number" then return item end
+    if type(item) ~= "string" then return nil end
+
+    local _, _, id = string.find(item, "item:(%d+)")
+    if id then return tonumber(id) end
+
+    return item
 end
 
 -- "colors.1" -> the table holding it and the final key, so a nested option key
@@ -1390,6 +1473,28 @@ function OB.RegisterModule(m)
     return m
 end
 
+--[==[ **Which classes earn combo points, in one place.**
+
+     Three things ask, and they have to agree: the combo point bar's own
+     `classes` gate, the nameplate option's predicate, and the nameplate
+     drawing itself. The third was not asking at all.
+
+     That is not theoretical. `GetComboPoints` answers 0 for a class that has
+     none, and the empty sockets added in v0.99.309 are drawn whether or not
+     anything ever fills them -- so a warrior with `showCombo` set, which one
+     shared profile is enough to do, wore five empty rings under every target
+     for the rest of the session.
+
+     **Rogues only, by Ollie's instruction on 2026-09-24**: "rogue only... should
+     not show for any other class". A druid in cat form does earn combo points,
+     and this deliberately does not draw them for one -- put `DRUID = true`
+     back in this table and all three askers follow. ]==]
+OB.comboClasses = { ROGUE = true }
+
+function OB.HasComboPoints()
+    return OB.comboClasses[OB.class] and true or false
+end
+
 -- true when this class may run the module at all
 function OB.ClassAllows(m)
     if not m then return false end
@@ -1527,12 +1632,59 @@ OB.coreEvents = {
      And the warning is tied to the module that supersedes it, so somebody who
      has deliberately turned ECO's Unit Frames off to keep the standalone is not
      nagged about a conflict they chose. ]]--
+--[[ The keys a zoom binding lives on. Named here beside the list that needs
+     them rather than reached for across modules: `modules/qol.lua` has its own
+     copy for its own purpose, and this one exists so the repair below can sweep
+     a key whose command the client has forgotten. ]]--
+local WHEEL_KEYS = { "MOUSEWHEELUP", "MOUSEWHEELDOWN" }
+
 OB.supersededAddOns = {
     { addon = "EquadisUnitFrames",  feature = "unitframes", label = "UnitFrames" },
     { addon = "EquadisOmniBars",    feature = "actionbars", label = "Action Bars" },
     { addon = "EquadisChatTweaks",  feature = "chat",       label = "Chat" },
     { addon = "EquadisThreatMeter", feature = "threat",     label = "Threat" },
     { addon = "UnitFramesImproved_Vanilla", feature = "unitframes", label = "UnitFrames" },
+
+    --[[ The trainer list, absorbed 2026-09-24 into the character panel module.
+         Two spellings because the Turtle port renamed the folder and the
+         original name is still what a lot of installs carry. Both draw a tab on
+         the same frame, and two tabs on one spellbook is the conflict this list
+         exists to name. ]]--
+    { addon = "WhatsTraining_Turtle", feature = "characterpanel",
+      label = "What's Training" },
+    { addon = "WhatsTraining", feature = "characterpanel",
+      label = "What's Training" },
+
+    --[[ Fine camera zoom, absorbed 2026-09-30 into the Misc page's Camera
+         section. Both would put their own action on the mouse wheel, and
+         whichever bound it last wins -- which reads as the step setting being
+         ignored rather than as two addons disagreeing. ]]--
+    --[==[ **And it leaves its keys behind when it goes.**
+
+         Ollie, 2026-10-14, having switched the standalone off as this list
+         asks: *"finezoom disable scroll wheel no longer works, cant zoom,
+         camera speed seems okay"*.
+
+         His `bindings-cache.wtf` says why, in two lines:
+
+             bind MOUSEWHEELUP FINEZOOMIN
+             bind MOUSEWHEELDOWN FINEZOOMOUT
+
+         `FINEZOOMIN` is a binding **FineZoom declares**. Disable the addon and
+         the command stops existing, but the saved binding still points at it --
+         so the wheel is bound to nothing at all. Not "zoom is coarse again":
+         the control is dead. Camera speed was fine because that is a CVar and
+         nothing had rebound it.
+
+         This is the cost of telling somebody to disable an addon whose feature
+         has been absorbed, and it is this addon's to pay: ECO is the successor
+         to exactly that binding, so it inherits the keys pointing at it rather
+         than leaving a dead wheel and a warning nobody can act on. ]==]
+    { addon = "FineZoom", feature = "qol", label = "FineZoom",
+      inherits = {
+          { from = "FINEZOOMIN",  to = "EQUADISOVERHAULZOOMIN" },
+          { from = "FINEZOOMOUT", to = "EQUADISOVERHAULZOOMOUT" },
+      } },
 
     --[[ **DragonflightUI-Reforged, once per thing it takes over.**
 
@@ -1612,6 +1764,103 @@ function OB.ConflictingAddOns()
     end
 
     return found
+end
+
+--[==[ **Keys left pointing at an addon that is no longer there.**
+
+     A binding belongs to the addon that declares it. Disable that addon and the
+     command goes, but the *saved binding* does not -- it sits in
+     `bindings-cache.wtf` naming a command the client no longer has, and the key
+     silently does nothing. There is no error and no clue; the key is simply
+     dead, which reads as the key being broken.
+
+     Only for an addon this one has **absorbed**, and only while that addon is
+     **not loaded**. Both halves matter. ECO is the successor to that exact
+     feature, so taking over the key is finishing the move rather than
+     helping itself to somebody's keyboard; and an addon that is loaded still
+     owns its own bindings, so re-enabling it hands them straight back.
+
+     Nothing else is touched. The command has to match the dead one exactly, so
+     a wheel the player has deliberately put on something else is left alone.
+
+     **Two ways of finding the keys, because one of them may not answer.**
+     `GetBindingKey` reads the binding table by command and should find a dead
+     one, since the table keeps entries for commands it cannot resolve -- that
+     is why they come back when the addon does. "Should" is doing work in that
+     sentence, so the keys the successor itself uses are swept as well with
+     `GetBindingAction`, which this module already relies on elsewhere. The
+     union is deduplicated, so a key found twice is rebound once. ]==]
+function OB.InheritOrphanedBindings()
+    if type(SetBinding) ~= "function" then return 0 end
+    if type(IsAddOnLoaded) ~= "function" then return 0 end
+
+    local taken, labels = 0, {}
+
+    for i = 1, table.getn(OB.supersededAddOns) do
+        local entry = OB.supersededAddOns[i]
+
+        if entry.inherits and not IsAddOnLoaded(entry.addon) then
+            for j = 1, table.getn(entry.inherits) do
+                local pair = entry.inherits[j]
+                local keys, seen = {}, {}
+
+                if type(GetBindingKey) == "function" then
+                    local a, b = GetBindingKey(pair.from)
+                    if a then table.insert(keys, a) end
+                    if b then table.insert(keys, b) end
+                end
+
+                --[[ And wherever the successor's own key would be, in case the
+                     lookup above cannot see a command the client has dropped. ]]--
+                if type(GetBindingKey) == "function" then
+                    local a, b = GetBindingKey(pair.to)
+                    if a then table.insert(keys, a) end
+                    if b then table.insert(keys, b) end
+                end
+
+                for k = 1, table.getn(WHEEL_KEYS) do
+                    table.insert(keys, WHEEL_KEYS[k])
+                end
+
+                for k = 1, table.getn(keys) do
+                    local key = keys[k]
+
+                    if not seen[key] then
+                        seen[key] = true
+
+                        local action = type(GetBindingAction) == "function"
+                                and GetBindingAction(key) or nil
+
+                        if action == pair.from and SetBinding(key, pair.to) then
+                            taken = taken + 1
+                            labels[entry.label] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if taken == 0 then return 0 end
+
+    if type(SaveBindings) == "function" then
+        local which = 1
+        if type(GetCurrentBindingSet) == "function" then
+            which = GetCurrentBindingSet()
+        end
+        SaveBindings(which)
+    end
+
+    --[[ Said out loud. This is somebody's key bindings, and the rule everywhere
+         else in this file is that changing them is announced. ]]--
+    for label in pairs(labels) do
+        OB.Print(label .. " is switched off and its keys pointed at nothing, "
+                .. "so this addon has taken them over. "
+                .. tostring(taken) .. " binding"
+                .. (taken == 1 and "" or "s") .. " repaired.")
+    end
+
+    return taken
 end
 
 --[[ Once a session. PLAYER_ENTERING_WORLD fires again on every loading screen,

@@ -1015,6 +1015,24 @@ function M:Read()
         return "inrange", yards
     end
 
+    --[==[ **No ranged attack is no reading, which is not the same as no bar.**
+
+         A warrior with an empty ranged slot, or a paladin, shaman or druid with
+         a relic in it, has nothing that can be in or out of range. The
+         fall-backs below would still produce a confident `inrange` from
+         `ASSUMED_MAX` -- a green bar describing a weapon that does not exist,
+         which is the `[8-90y]` fault in another form.
+
+         So the reading is withheld and the bar falls to its No Target colour,
+         where `OnDraw` now keeps it on screen. The two facts are separate: that
+         there is nothing to say, and whether the bar is drawn while saying
+         nothing. ]==]
+    if not self.spell then
+        self.answered = nil
+        self.measured, self.bandLow, self.bandHigh = nil, nil, nil
+        return nil, nil
+    end
+
     if not UnitExists("target") then
         self.answered = nil
         self.measured, self.bandLow, self.bandHigh = nil, nil, nil
@@ -1366,20 +1384,26 @@ function M:OnDraw()
          Any visible opacity turns it back into a drawn placeholder, which is
          what makes the No Target colour a setting worth having rather than an
          elaborate way of spelling "hidden". ]]--
-    --[[ No ranged attack at all: the bar goes, whatever is targeted.
+    --[==[ **Switched on means on screen, with or without a ranged weapon.**
 
-         A warrior with an empty ranged slot, or a paladin, shaman or druid with
-         a relic in it, has nothing that can be in or out of range -- so "can I
-         hit my target from here" has no answer rather than a pessimistic one.
+         Ollie, 2026-10-26: *"if rangecheck bar is enable. it should always be
+         visible even without a ranged weapon equipped."*
 
-         It used to fall back to the configured range instead and advertise it,
-         which is where a warrior holding no gun got told `[8-90y]`: a confident
-         interval describing a weapon that did not exist. Constraint 24 -- a bar
-         with nothing to draw hides itself. ]]--
-    if not self.spell then
-        OB.SetBarShown(self, false)
-        return
-    end
+         This used to hide the whole bar when there was no ranged attack -- a
+         warrior with an empty slot, a paladin with a relic -- on the reasoning
+         that a bar with nothing to draw hides itself. The reasoning is sound
+         about the *reading* and wrong about the *bar*: switching a bar on is a
+         decision about the layout, and a row that disappears whenever you
+         unequip a gun takes the rest of the stack with it.
+
+         What it must not do is invent an answer. `Read` withholds the state
+         rather than producing one from `ASSUMED_MAX`, so what is drawn here is
+         the No Target colour and no text at all -- the same placeholder as
+         having no target, which is the honest shape of "nothing to report".
+
+         The rule below still applies and is now the only one: a No Target
+         colour with no opacity in it means the player asked for no placeholder,
+         and that is still obeyed. ]==]
 
     if not self.state and (color[4] or 1) <= 0 then
         OB.SetBarShown(self, false)

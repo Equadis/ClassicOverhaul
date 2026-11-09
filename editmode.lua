@@ -201,6 +201,17 @@ OB.movables = OB.movables or {}
      Keyed by frame rather than appended blindly, because `SetDragMode` runs
      every time the mode is toggled and a list that grew each time would draw
      the same outline forty deep by the end of an evening. ]]--
+--[==[ **Which unlock registered a frame**, so an outline can be shown over a
+     frame that is *inactive* without showing one for a feature that is *off*.
+
+     Only an enabled module is asked to unlock, and unlocking is what registers
+     its frames -- so "registered during this unlock" is the same fact as
+     "belongs to something switched on", read without every one of the fourteen
+     call sites having to name itself. A module switched off after registering
+     keeps its entry; the stamp goes stale and it is treated exactly as it was
+     before. ]==]
+OB.editGeneration = 0
+
 function OB.MarkMovable(frame, label)
     if not frame or not frame.CreateTexture then return false end
 
@@ -209,11 +220,13 @@ function OB.MarkMovable(frame, label)
             --[[ A better name later is still worth taking: the frame may have
                  been registered before the module knew what to call it. ]]--
             if label then OB.movables[i].label = label end
+            OB.movables[i].generation = OB.editGeneration
             return false
         end
     end
 
-    table.insert(OB.movables, { frame = frame, label = label })
+    table.insert(OB.movables,
+            { frame = frame, label = label, generation = OB.editGeneration })
     return true
 end
 
@@ -230,7 +243,18 @@ function OB.MovableOutline(entry)
     if not frame then return nil end
     if entry.outline then return entry.outline end
 
-    local outline = CreateFrame("Frame", nil, frame)
+    --[==[ **Parented to what the frame is parented to, not to the frame.**
+
+         A child of a hidden frame cannot draw, whatever it is told. That was
+         fine while an outline only ever appeared over something already on
+         screen, and it is the whole obstacle to showing one for a bar that is
+         merely *inactive* -- a cast bar between casts, combo points at zero, an
+         off-hand bar on somebody holding one weapon. Those are the boxes that
+         most need dragging, because they are the ones you cannot see.
+
+         A sibling inherits the same scale and the same visibility chain, so it
+         still follows the frame everywhere except into being hidden with it. ]==]
+    local outline = CreateFrame("Frame", nil, frame:GetParent() or UIParent)
     outline:SetPoint("TOPLEFT", frame, "TOPLEFT", -OUTLINE_PAD, OUTLINE_PAD)
     outline:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", OUTLINE_PAD, -OUTLINE_PAD)
 
@@ -329,6 +353,10 @@ end
      does. Frames that have gone away since they were registered are dropped as
      they are found rather than swept separately -- a module rebuilt is a frame
      nobody is going to move. ]]--
+--[[ How faint an outline is when the thing it marks is not currently drawn. Low
+     enough to read as "not here right now", solid enough to grab. ]]--
+local INACTIVE_OUTLINE_ALPHA = 0.4
+
 function OB.ShowOutlines(on)
     local kept = {}
 
@@ -342,12 +370,37 @@ function OB.ShowOutlines(on)
             local outline = OB.MovableOutline(entry)
 
             if outline then
-                --[[ Only over something that is on screen. An outline round a
-                     hidden pet bar is a rectangle floating over the world with
-                     nothing in it, and it is the first thing anybody would try
-                     to drag. ]]--
-                if on and frame:IsShown() then
+                --[==[ **Inactive is not the same as off.**
+
+                     Ollie, 2026-09-30: *"editmode should show inactive (but not
+                     disabled) moveboxes"*.
+
+                     This showed an outline only over something already on
+                     screen, guarding against "a rectangle floating over the
+                     world with nothing in it" -- which is right for a feature
+                     somebody switched off and wrong for one that simply has
+                     nothing to say this second. A cast bar between casts, combo
+                     points at zero, an off-hand bar on a character holding one
+                     weapon: all enabled, all invisible, and all impossible to
+                     position.
+
+                     The difference is read from the generation stamp: only an
+                     enabled module is asked to unlock, and unlocking is what
+                     registers its frames. Something registered by this unlock
+                     is switched on, whether or not it is drawing.
+
+                     **Shown dimmed**, so the two states are still told apart at
+                     a glance -- a solid box is something you can see, a faint
+                     one is where it will be. ]==]
+                local live = (entry.generation == OB.editGeneration)
+                local drawn = frame:IsShown() and true or false
+
+                if on and (drawn or live) then
                     if outline.text then outline.text:SetText(entry.label or "") end
+
+                    if outline.SetAlpha then
+                        outline:SetAlpha(drawn and 1 or INACTIVE_OUTLINE_ALPHA)
+                    end
 
                     --[[ **In front of everything, not merely in front of its
                          parent.**
@@ -372,6 +425,11 @@ function OB.ShowOutlines(on)
 
                     outline:Show()
                 else
+                    --[[ Full alpha on the way out, or a box that was faint
+                         because its bar was idle stays faint the next time edit
+                         mode opens with the bar running. ]]--
+                    if outline.SetAlpha then outline:SetAlpha(1) end
+
                     --[[ Put back where it was, so an outline that is not in use
                          is not sitting in the top layer of the interface. ]]--
                     if outline.eqEcoStrata and outline.SetFrameStrata then
@@ -521,6 +579,15 @@ end
 function OB.SetEditMode(on)
     on = on and true or false
     OB.editMode = on
+
+    --[==[ **A new generation before anything unlocks.**
+
+         Every frame an enabled module registers below is stamped with this
+         number, and `OB.ShowOutlines` uses it to tell a frame that is *inactive*
+         from one belonging to a feature that is *off*. Bumped only on the way
+         in: leaving edit mode must not restamp anything, or the stamp would say
+         "current" for whatever happened to be registered last. ]==]
+    if on then OB.editGeneration = (OB.editGeneration or 0) + 1 end
 
     --[[ Everything the modules say from here down is held until the one line at
          the bottom of this function. See `OB.HoldPrint`. ]]--

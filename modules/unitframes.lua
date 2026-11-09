@@ -960,8 +960,23 @@ function M:PVPTimerText()
     local parent = self:PVPTimerFrame() or getglobal("PlayerFrame") or UIParent
     if not parent or not parent.CreateFontString then return nil end
 
-    local text = parent:CreateFontString("EquadisClassicOverhaulPVPTimer", "OVERLAY")
+    --[==[ **With a template, and registered.**
+
+         This was a bare `CreateFontString(name, "OVERLAY")` -- **no inherited
+         template**, which in 1.12 means no font object at all, and colouring or
+         writing to such a string is an error rather than a no-op. It is the
+         exact mistake `OB.NewText` was written to prevent, and it went in with
+         the PvP countdown in v0.99.324.
+
+         It cannot go through `OB.NewText` unchanged, because this string needs
+         a **name** -- the countdown is looked up by it. So it is created the
+         same way `OB.NewText` creates one, with the template, and registered in
+         the same registry so `/eq selftest` counts it with the rest. ]==]
+    local text = parent:CreateFontString("EquadisClassicOverhaulPVPTimer",
+            "OVERLAY", "GameFontNormal")
     if not text then return nil end
+
+    if OB.texts then table.insert(OB.texts, text) end
 
     --[==[ **Outlined, because it is drawn onto artwork rather than onto a
          backdrop.**
@@ -1139,6 +1154,15 @@ function M:DebugPVP()
     say("replacePlayer:  " .. tostring(self:Config().replacePlayer))
 
     say("GetPVPTimer:    " .. type(GetPVPTimer))
+    say("GetPVPDesired:  " .. type(GetPVPDesired))
+
+    --[==[ **The question the readout is really asking.** Flagged says nothing
+         about whether the flag is ending; this does, and a countdown is only
+         drawn when it answers `false`. ]==]
+    local desired, source = self:PVPDesired()
+    say("pvp desired:    " .. tostring(desired) .. "  (from " .. tostring(source) .. ")")
+    say("TogglePVP hook: " .. tostring(type(TogglePVP) == "function"
+            and EquadisOverhaulTogglePVP == TogglePVP))
     say("UnitIsPVP:      " .. type(UnitIsPVP))
 
     local flagged = type(UnitIsPVP) == "function" and UnitIsPVP("player") or nil
@@ -1212,6 +1236,103 @@ end
      autocomplete was making. ]==]
 local PVP_GRACE = 300
 
+--[==[ **Being flagged and being *scheduled to unflag* are different facts, and
+     this feature had only ever observed the first.**
+
+     The inference was: a `PLAYER_FLAGS_CHANGED` for the player that leaves you
+     still flagged, with AFK and DND unchanged, is `/pvp` being switched off.
+     That is true, and it is also true of `/pvp` being switched **on** while you
+     are already flagged by an action -- same event, same flags, opposite
+     meaning. So turning PvP *on* started a five-minute countdown for a flag
+     that is never going to drop, which is what "should only show if pvp is
+     actually scheduled to turn off" was reported as. A permanent flag on a PvP
+     realm or in a battleground reads the same way.
+
+     What decides it is the **desired** flag, the thing `/pvp` sets, and there
+     are two ways to know it:
+
+     - `GetPVPDesired()`, if this build exports it. Vanilla 1.12's FrameXML
+       never calls it -- `/pvp` is `TogglePVP()` and nothing else -- so whether
+       it exists here is a question only this client can answer. Asked, and
+       believed when it answers.
+     - **The toggle itself.** `/pvp`, the player-frame menu and any macro all go
+       through `TogglePVP`, so wrapping it is a direct observation of the one
+       event that changes the desired state, rather than a guess about which of
+       two meanings a flag change had.
+
+     Until one of them has spoken the state is **unknown**, and unknown does not
+     start a countdown. A number that is sometimes absent is worth more than one
+     that is sometimes about nothing. ]==]
+function M:PVPDesired()
+    if type(GetPVPDesired) == "function" then
+        local ok, desired = pcall(GetPVPDesired)
+        if ok then return desired and true or false, "client" end
+    end
+
+    if self.pvpDesired ~= nil then return self.pvpDesired, "toggle" end
+    return nil, "unknown"
+end
+
+--[[ `TogglePVP` is wrapped rather than replaced, and recognised through a
+     global for the reason the tooltip's OnShow wrapper had to learn: the guard
+     would live on a module table that a reload rebuilds while the function is a
+     global that it does not, so a reload would stack this on itself. ]]--
+function M:InstallPVPToggleHook()
+    if type(TogglePVP) ~= "function" then return false end
+
+    if EquadisOverhaulTogglePVP and TogglePVP == EquadisOverhaulTogglePVP then
+        return false
+    end
+
+    local previous = TogglePVP
+
+    if EquadisOverhaulTogglePVPInner and TogglePVP == EquadisOverhaulTogglePVP then
+        previous = EquadisOverhaulTogglePVPInner
+    end
+
+    local wrapper = function()
+        local m = EquadisClassicOverhaul.modules.unitframes
+        if m then m:NotePVPToggle() end
+        return previous()
+    end
+
+    EquadisOverhaulTogglePVP = wrapper
+    EquadisOverhaulTogglePVPInner = previous
+    TogglePVP = wrapper
+    return true
+end
+
+--[==[ **The toggle, read as a flip of whatever it was.**
+
+     The state before the first toggle of a session is not knowable without
+     `GetPVPDesired`, so it is taken from the flag: somebody typing `/pvp` while
+     flagged is either turning it off (they had it on) or confirming a flag they
+     got by fighting (they had it off and now want it on). The first is the
+     common one and the one with a countdown, so an unknown state flips from
+     "on" when flagged and from "off" when not.
+
+     Wrong at worst for one toggle, and the next one is right, because after
+     this the state is no longer unknown. ]==]
+function M:NotePVPToggle()
+    local was = self.pvpDesired
+
+    if was == nil then
+        local flagged = type(UnitIsPVP) == "function" and UnitIsPVP("player") and true or false
+        was = flagged
+    end
+
+    self.pvpDesired = not was
+
+    --[[ Turned on is a flag that is not going anywhere. Anything counting down
+         is counting down to nothing. ]]--
+    if self.pvpDesired then
+        self:ClearPVPGrace()
+        self:HidePVPTimer()
+    end
+
+    return self.pvpDesired
+end
+
 function M:PVPFlags()
     local pvp = type(UnitIsPVP) == "function" and UnitIsPVP("player") and true or false
     local afk = type(UnitIsAFK) == "function" and UnitIsAFK("player") and true or false
@@ -1248,6 +1369,15 @@ function M:NotePVPFlags()
 
     --[[ Already counting. A second flag change does not restart it. ]]--
     if self:PVPGraceStart() then return false end
+
+    --[==[ **And only when the flag is actually scheduled to drop.**
+
+         This is the same event whether `/pvp` went off or on, so the flags
+         alone cannot say which. `PVPDesired` can: off means it is winding
+         down, on means it is permanent, and unknown means nobody has told us
+         -- and unknown does not start a clock. See the note above it. ]==]
+    local desired = self:PVPDesired()
+    if desired ~= false then return false end
 
     self:StartPVPGrace()
     return true
@@ -1356,6 +1486,15 @@ function M:UpdatePVPTimer(force)
     --[[ Still the flag first: a countdown for somebody who is not flagged is a
          number about nothing. ]]--
     if type(UnitIsPVP) ~= "function" or not UnitIsPVP("player") then
+        self:ClearPVPGrace()
+        self:HidePVPTimer()
+        return false
+    end
+
+    --[==[ **A flag that is wanted is not a flag that is ending.** Checked here
+         as well as where the clock starts, because a grace already running when
+         `/pvp` is switched back on has to go at once rather than run out. ]==]
+    if self:PVPDesired() == true then
         self:ClearPVPGrace()
         self:HidePVPTimer()
         return false
@@ -1766,7 +1905,22 @@ function M:ReactionColor(unit)
     if not reaction then return cfg.hostileColor end
 
     if reaction > 4 then return cfg.friendlyColor end
-    if reaction == 4 then return cfg.neutralColor end
+
+    --[==[ **Neutral until it swings at you**, the same rule the nameplates
+         follow and for the same reason.
+
+         Ollie asked for this on both, and it was missing from both: the client
+         colours a target straight out of `UnitReactionColor[reaction]`, and a
+         reaction is a faction standing that aggro does not move. A boar you
+         have pulled stays 4 -- yellow -- for the whole fight.
+
+         `OB.UnitFightingYou` asks the one thing that does change: who it is
+         attacking. For the target that is `targettarget`, which every 1.12
+         client has. ]==]
+    if reaction == 4 then
+        if OB.UnitFightingYou(unit) then return cfg.hostileColor end
+        return cfg.neutralColor
+    end
 
     return cfg.hostileColor
 end
@@ -2008,17 +2162,42 @@ function M:FeignActualHealth(unit)
         local tip = CreateFrame("GameTooltip", "EquadisUnitFrameFeignScanner",
                 UIParent, "GameTooltipTemplate")
         if not tip then return nil end
-        if tip.SetOwner then tip:SetOwner(tip, "ANCHOR_NONE") end
         self.feignScanner = tip
         if tip.GetChildren then self.feignScannerBar = tip:GetChildren() end
     end
 
     local tip, bar = self.feignScanner, self.feignScannerBar
     if not tip or not tip.SetUnit then return nil end
+
+    --[==[ **Re-owned on every read, not once when it was built.**
+
+         `SetOwner` is also what puts a tooltip's anchor back, and this one is
+         deliberately anchored nowhere. Setting it at build time and never again
+         leaves the frame carrying whatever the last thing to touch it left
+         behind, which is the difference between a scanner nobody sees and a
+         tooltip that turns up somewhere odd. ]==]
+    if tip.SetOwner then tip:SetOwner(tip, "ANCHOR_NONE") end
     if tip.ClearLines then tip:ClearLines() end
+
     tip:SetUnit(unit)
 
     local value = bar and bar.GetValue and bar:GetValue()
+
+    --[==[ **Put away again, every time, before anything else can happen.**
+
+         Reported by Ollie on 2026-09-24 as the feign death tooltip appearing
+         strangely, and it is exactly that: **every `Set*` on a 1.12 tooltip
+         shows it.** Filling one in and putting it on screen is a single action,
+         not two, so `SetUnit` on a scanner that is never hidden again leaves a
+         tooltip sitting on the player's screen -- anchored nowhere, appearing
+         whenever anybody in range feigns.
+
+         Hidden here rather than at the call sites: this is the only place that
+         shows it, so it is the only place that can be trusted to put it away.
+         Within one Lua call nothing is drawn in between, so the player never
+         sees the frame it briefly was. ]==]
+    if tip.Hide then tip:Hide() end
+
     if value and value > 0 then return value end
     return nil
 end
@@ -2395,10 +2574,36 @@ function M:HideBarText(bar, text)
 
     self.auxBarTextByBar[bar][text] = true
 
-    if text.SetText then text:SetText("") end
+    self:SafeSetText(text, "")
+
     if text.SetAlpha then text:SetAlpha(0) end
     if text.Hide then text:Hide() end
 
+    return true
+end
+
+--[==[ **Writing to a font string this addon did not create.**
+
+     This module reaches into the client's own unit frames: it suppresses their
+     bar text, restores it, and writes into their cast bars. Every one of those
+     strings was created by the client, by another addon, or by nothing at all
+     -- and a FontString with no inherited template has **no font object**, on
+     which 1.12's `SetText` is an **error**, not a no-op.
+
+     It took the whole styling pass down with it, and with it every setting that
+     pass was applying: the symptom is not "one label is missing", it is "none
+     of my settings are being applied". That is the shape of what Ollie reported
+     on 2026-09-28, and `HideBarText` was one of three places this module writes
+     to somebody else's string.
+
+     A string that cannot take text is skipped rather than written to. For the
+     suppression path that costs nothing -- `SetAlpha(0)` and `Hide` are what
+     actually hide a string, and both are safe on a fontless one. ]==]
+function M:SafeSetText(region, value)
+    if not region or not region.SetText then return false end
+    if not region.GetFont or not region:GetFont() then return false end
+
+    region:SetText(value)
     return true
 end
 
@@ -2413,7 +2618,7 @@ function M:ReassertAuxBarTexts()
     for bar, owned in pairs(self.auxBarTextByBar) do
         if self:BarRole(bar) then
             for text in pairs(owned) do
-                if text.SetText then text:SetText("") end
+                self:SafeSetText(text, "")
                 if text.SetAlpha then text:SetAlpha(0) end
                 if text.Hide then text:Hide() end
             end
@@ -2436,7 +2641,7 @@ function M:RestoreAuxBarTexts(entry)
                 local snap = self.auxBarTextOriginal and self.auxBarTextOriginal[text]
                 if snap then
                     if text.SetAlpha then text:SetAlpha(snap.alpha or 1) end
-                    if text.SetText and snap.value ~= nil then text:SetText(snap.value) end
+                    if snap.value ~= nil then self:SafeSetText(text, snap.value) end
                     if snap.shown then
                         if text.Show then text:Show() end
                     elseif text.Hide then
@@ -3364,7 +3569,22 @@ function M:RestoreObject(name, geometryOnly)
         if obj.SetVertexColor and snap.vertex and table.getn(snap.vertex) >= 3 then
             obj:SetVertexColor(unpack(snap.vertex))
         end
-        if obj.SetFont and snap.font and snap.font[1] then obj:SetFont(unpack(snap.font)) end
+        --[==[ **Restoring a font can take one away.**
+
+             `snap.font` is whatever `GetFont()` answered when the snapshot was
+             taken, and it can hold a path with **no size** -- from a string the
+             client had not laid out yet, or one another addon had half set up.
+             `SetFont(path, nil)` fails, and on 1.12 a failed `SetFont` leaves
+             the FontString with **no font object at all**, not its previous one.
+
+             So the restore, whose whole job is putting things back, was able to
+             strip a font that was working. The next `SetText` on it is then an
+             error and takes the pass down. Guarded on the size being usable,
+             which is the one part `snap.font[1]` never checked. ]==]
+        if obj.SetFont and snap.font and snap.font[1]
+                and type(snap.font[2]) == "number" and snap.font[2] > 0 then
+            obj:SetFont(snap.font[1], snap.font[2], snap.font[3])
+        end
         if obj.SetTextColor and snap.textColor then obj:SetTextColor(unpack(snap.textColor)) end
         if obj.SetStatusBarTexture and snap.barTexture then obj:SetStatusBarTexture(snap.barTexture) end
         if obj.SetStatusBarColor and snap.barColor then obj:SetStatusBarColor(unpack(snap.barColor)) end
@@ -5401,7 +5621,14 @@ function M:StyleCastText(region, cfg)
 
         if path then
             local _, current, flags = region:GetFont()
-            region:SetFont(path, size or current or 10, flags)
+            --[[ `size or current or 10` reads as "ten unless somebody gave a
+                 size". It is not: **zero is truthy in Lua**, so a zero sails
+                 through and `SetFont` fails, leaving no font at all. The same
+                 shape as the minimap's zone size, fixed in v0.99.332. ]]--
+            local useSize = size or current or 10
+            if type(useSize) ~= "number" or useSize <= 0 then useSize = 10 end
+
+            region:SetFont(path, useSize, flags)
         end
     end
 
@@ -5420,9 +5647,14 @@ end
      being looked at. ]]--
 local CAST_PREVIEW_NAME = "Greater Heal"
 
+--[[ The client's own cast bar regions, so the same rule as `SafeSetText`
+     applies -- a region with no font is skipped rather than written to. The
+     cache is only updated on a write that happened, or a later pass would
+     believe it had already said this. ]]--
 local function castText(region, cache, value)
-    if not region then return end
+    if not region or not region.SetText then return end
     if region[cache] == value then return end
+    if not region.GetFont or not region:GetFont() then return end
 
     region[cache] = value
     region:SetText(value or "")
@@ -5432,6 +5664,21 @@ function M:UpdateCastBar(id, unit, enabled)
     local cfg = self:Config()
     local bar = self:CastBar(id)
     if not bar then return false end
+
+    --[==[ **A preview is left alone.**
+
+         `PreviewCastBars` puts a sample on this bar so it can be arranged or
+         looked at without finding a long spell to cast. Nothing read the flag it
+         sets, so the next ordinary pass -- and there is one immediately, because
+         both modes end by refreshing -- found nothing being cast and hid the bar
+         again.
+
+         Edit mode appeared to work only because of when its refresh happened to
+         fall. Test mode showed nothing at all, which is what Ollie reported on
+         2026-09-30. The flag is the statement "this bar is showing something
+         deliberately fake"; honouring it is what makes both modes work for the
+         same reason rather than one of them working by accident. ]==]
+    if bar.ecoPreview then return true end
 
     if not enabled then
         bar:Hide()
@@ -5845,6 +6092,35 @@ end
 
 function M:DragMode()
     return self.dragging and true or false
+end
+
+--[==[ **Test mode shows the cast bar too.**
+
+     Ollie, 2026-09-30: *"test mode needs to show the cast bar as well"*.
+
+     Edit mode already previewed it -- `SetDragMode` calls `PreviewCastBars`,
+     because you cannot drag a bar that only exists while you are casting. Test
+     mode did not, and it is the mode that exists precisely to *look* at
+     something: seeing a cast bar's colours, its timer and its icon otherwise
+     means finding a long spell and casting it, then doing it again after every
+     change to a setting.
+
+     The two modes ask for the same preview, so they call the same function.
+
+     **Edit mode wins on the way out.** Leaving test mode while still arranging
+     the interface must not take the preview away from underneath the drag
+     handles -- the bar would vanish mid-arrangement, which is the fault this
+     feature exists to avoid. ]==]
+function M:TestStart(now)
+    self:PreviewCastBars(true)
+    return true
+end
+
+function M:TestStop()
+    if OB.EditMode and OB.EditMode() then return false end
+
+    self:PreviewCastBars(false)
+    return true
 end
 
 function M:SetDragMode(on)
@@ -6302,6 +6578,11 @@ function M:OnEvent()
          addon's copy the one that stands. ]]--
     if event == "PLAYER_ENTERING_WORLD" then
         self:PlaceFrames()
+
+        --[[ Here rather than at load: `TogglePVP` is a client global, and an
+             addon loading after this one can replace it. Re-taken every time
+             the world is entered, which is every reload. ]]--
+        self:InstallPVPToggleHook()
     end
 
     if event == "PLAYER_FLAGS_CHANGED" and (not arg1 or arg1 == "player") then

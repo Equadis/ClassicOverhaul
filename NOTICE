@@ -175,6 +175,96 @@ QuestHaste_IsComplete, which does not exist -- an error every time an
 accept-only quest is forgotten with Alt.
 
 ================================================================================
+FineZoom -- fine camera zoom
+MIT License
+Copyright (c) Stormhand
+
+Used by: modules/qol.lua, the Camera section; Bindings.xml
+
+The repository carries no LICENSE file; MIT is stated in its README. Recorded
+here rather than assumed, for the same reason as QuestHaste above.
+
+**The whole addon is sixty-four lines and the idea is the valuable part.** 1.12
+exposes no zoom-speed CVar -- the mouse wheel moves the camera one fixed jump and
+nothing in Lua can change it. What Stormhand worked out is that you do not need
+one: a *binding* of your own calling `CameraZoomIn(step)` gets any step you like,
+and rebinding the wheel onto it makes that the wheel's behaviour. The README says
+so plainly, which is why this was quick to port.
+
+What was taken: that approach, the default step of 0.2, the 0.05 to 5 clamp, and
+the wheel-binding convenience (`/fzbind`, here a button on the Camera section).
+
+What changed: the step lives in this addon's profile rather than in a
+`FineZoomStep` global, so it travels with a profile and sits beside the other
+camera settings; `SaveBindings` is called with the current binding set rather
+than assumed; and the two zooms are named under "Equadis' Overhaul: Camera" in
+the client's own Key Bindings screen.
+
+Added later (2026-10-26): the saved `FineZoomStep` is copied into the profile
+once, so somebody switching FineZoom off keeps the step they tuned, and
+`/finezoom <step>` and `/fzbind` exist again as the slider and the button.
+
+================================================================================
+What's Training? Turtle -- the class trainer list
+MIT License
+Copyright (c) 2019 Sveng; Turtle port by spawnedc and rebasedkon
+
+<https://github.com/rebasedkon/WhatsTraining_Turtle>
+
+Used by: modules/characterpanel.lua, and data/training/
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+**The data is theirs and is copied verbatim**, which is the opposite of how
+every other entry in this file works. 1,453 spells across nine classes, with
+the levels, ranks, icons, schools, prerequisites and race restrictions, plus 217
+rank-override rows -- that is years of somebody checking a trainer's window
+against a database, and there is no version of "port the ideas" that produces
+it. The nine files in `data/training/` differ from upstream's `Classes/Turtle/`
+in two assignment lines each and nothing else, and the suite counts all three
+totals against the upstream file so drift is a failure rather than a surprise.
+
+The reading of that data is this addon's: the categorising, the spellbook join,
+the tab and the list are written to ECO's shapes.
+
+**Three things were changed on the way through**, each noted at the line it
+happens:
+
+  * **Race tokens are compared case- and space-insensitively**, and the
+    client's `Scourge` is understood as Undead. The tables say `UNDEAD`,
+    `NIGHTELF` and `HIGHELF`; `UnitRace` answers `NightElf`, and 1.12 has no
+    `UNDEAD` at all. Upstream compares the two literally. One row in its druid
+    table also says `Gnome` where its neighbours say `GNOME`. Every one of
+    those spellings now meets -- and the failure it avoids is silent, because a
+    race-restricted spell that is filtered out looks exactly like a spell the
+    class does not have.
+
+  * **`zzOLD Pummel` is not offered.** It is in the upstream warrior table;
+    `zz` is Blizzard's own marker for a spell that is no longer real.
+
+  * **The list is scrolled by moving what is drawn** rather than through a
+    `FauxScrollFrame`, which is this addon's own convention for a list on a
+    frame it does not own.
+
+================================================================================
 DragonflightUI-Reforged -- action bars
 MIT License
 Copyright (c) Guzruul, reforged by Stormhand

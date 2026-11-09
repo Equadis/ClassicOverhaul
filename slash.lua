@@ -1056,6 +1056,38 @@ SlashCmdList["EQUADISOMNIBARS"] = function(msg)
         return
     end
 
+    --[==[ **Watching auras arrive, refresh, fade and be forgotten.**
+
+         With the unit each one is filed under, which on a SuperWoW client is a
+         GUID for a nameplate and a name for anything the combat log reported --
+         and the difference between those two is most of what goes wrong here. ]==]
+    if cmd == "auradebug" then
+        OB.auraDebug = not OB.auraDebug
+
+        Say("aura debug " .. (OB.auraDebug and "on" or "off") .. ".")
+
+        if OB.auraDebug then
+            OB.Raw("  applied / refreshed / faded / forgotten, and a plate "
+                    .. "changing unit.")
+            OB.Raw("  a GUID means the plate asked the client; a name means "
+                    .. "the combat log said so.")
+        end
+
+        return
+    end
+
+    if cmd == "comparedebug" then
+        local tip = OB.modules and OB.modules.tooltip
+
+        if not tip or type(tip.DebugCompare) ~= "function" then
+            Say("the tooltip module is not loaded.")
+            return
+        end
+
+        tip:DebugCompare()
+        return
+    end
+
     if cmd == "blipprobe" then
         local map = OB.modules and OB.modules.map
 

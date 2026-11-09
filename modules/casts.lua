@@ -237,6 +237,13 @@ local spellIcons = nil
      good for the generation it was taken in. ]==]
 OB.spellIconGeneration = 0
 
+--[[ Dropped, so the next lookup rebuilds. The generation is bumped by the
+     rebuild itself, which is what stops a cast bar trusting an icon -- or a
+     failed lookup -- from the map that has just been thrown away. ]]--
+function OB.ForgetSpellIcons()
+    spellIcons = nil
+end
+
 function OB.RebuildSpellIcons()
     spellIcons = {}
     OB.spellIconGeneration = (OB.spellIconGeneration or 0) + 1
@@ -284,7 +291,105 @@ function OB.RebuildSpellIcons()
         end
     end
 
+    --[==[ **Items, because plenty of what you cast is not a spell.**
+
+         Ollie, 2026-09-30, with a screenshot of an eight second cast bar wearing
+         a question mark: *"its using the ? icon even though we know the item"*.
+         It was a Portable Wormhole Generator -- and the walk above reads the
+         **spellbook**, which no item is in. Every trinket, every engineering
+         gadget, every bandage came up bare for the same reason.
+
+         The client hands the cast bar a *name* and nothing else, so the map has
+         to be by name, and the two places an item you can use actually is are
+         your bags and your own body. Both are cheap to walk and both carry the
+         texture already -- no `GetItemInfo` call and no cache to wait on. ]==]
+    --[[ A texture is a path. Insisted on rather than assumed: these calls are
+         the client's, forks answer them differently, and a table stored here
+         would reach `SetTexture` as one -- which draws nothing and says
+         nothing. ]]--
+    local function remember(name, texture)
+        if type(name) ~= "string" or name == "" then return end
+        if type(texture) ~= "string" or texture == "" then return end
+
+        if not spellIcons[name] then spellIcons[name] = texture end
+    end
+
+    if type(GetContainerNumSlots) == "function"
+            and type(GetContainerItemInfo) == "function" then
+        for bag = 0, 4 do
+            local slots = GetContainerNumSlots(bag) or 0
+
+            for slot = 1, slots do
+                local texture = GetContainerItemInfo(bag, slot)
+                local link = type(GetContainerItemLink) == "function"
+                        and GetContainerItemLink(bag, slot) or nil
+
+                remember(OB.ItemNameFromLink(link), texture)
+            end
+        end
+    end
+
+    --[[ Worn rather than carried: a trinket is the on-use item people reach for
+         most, and it is in neither the spellbook nor a bag. ]]--
+    if type(GetInventoryItemTexture) == "function"
+            and type(GetInventoryItemLink) == "function" then
+        for slot = 1, 19 do
+            remember(OB.ItemNameFromLink(GetInventoryItemLink("player", slot)),
+                    GetInventoryItemTexture("player", slot))
+        end
+    end
+
     return spellIcons
+end
+
+--[[ The name out of an item link -- `|cff...|Hitem:...|h[Name]|h|r`. The bracket
+     pair is the only part of that shape that is the same on every client and in
+     every locale, which is why it is matched rather than parsed. ]]--
+function OB.ItemNameFromLink(link)
+    if type(link) ~= "string" then return nil end
+
+    local _, _, name = string.find(link, "%[(.+)%]")
+    return name
+end
+
+--[==[ **The shipped item list, asked only when nothing else knew.**
+
+     An item the player no longer carries -- one sold, or one used from a bag
+     that has since emptied -- is in neither walk above, but the client may still
+     have it cached and this addon ships the names of 22,397 of them. Resolving
+     the name to an id is a table lookup; `GetItemInfo` then answers with the
+     texture if the client has ever seen the item.
+
+     **Built on the first miss, not at login.** Reversing 22,000 names costs a
+     table that most sessions never need, and the misses that need it are rare by
+     definition -- everything you are holding was answered above. ]==]
+local itemIdsByName = nil
+
+function OB.ItemIconByName(name)
+    if not name or name == "" then return nil end
+    if type(GetItemInfo) ~= "function" then return nil end
+
+    local db = EquadisClassicOverhaulItemDB
+    if type(db) ~= "table" or type(db.names) ~= "table" then return nil end
+
+    if not itemIdsByName then
+        itemIdsByName = {}
+
+        --[[ First id wins. Several ids share a name across the catalogue -- the
+             test versions, the seasonal reissues -- and they share the art with
+             the one people mean. ]]--
+        for id, itemName in pairs(db.names) do
+            if not itemIdsByName[itemName] then itemIdsByName[itemName] = id end
+        end
+    end
+
+    local id = itemIdsByName[name]
+    if not id then return nil end
+
+    local ok, _, _, _, _, _, _, _, _, texture = pcall(GetItemInfo, id)
+    if not ok then return nil end
+
+    return texture
 end
 
 --[==[ The client's own "no art for this", used where a spell cannot be
@@ -302,6 +407,16 @@ function OB.SpellIcon(name)
 
     local seen = OB.auraIcons and OB.auraIcons[name]
     if seen then return seen end
+
+    --[[ Last, because it is the only source that can miss the client's cache
+         and the only one that builds a table to answer. Remembered either way,
+         so a name that cannot be resolved is not resolved again on every
+         frame. ]]--
+    local fromItem = OB.ItemIconByName(name)
+    if fromItem then
+        spellIcons[name] = fromItem
+        return fromItem
+    end
 
     --[==[ **The question mark, rather than nothing.**
 
@@ -355,6 +470,12 @@ local EVENTS = {
     --[[ The spellbook changes when you learn, train or respec, and the icon
          map is built from it. ]]--
     "SPELLS_CHANGED", "LEARNED_SPELL_IN_TAB",
+
+    --[[ Items carry icons too now, so the map goes stale when what you are
+         holding or wearing changes -- a trinket just equipped, a gadget just
+         bought. Dropped rather than rebuilt: the next cast rebuilds it, and
+         `BAG_UPDATE` fires far more often than anybody casts. ]]--
+    "BAG_UPDATE", "UNIT_INVENTORY_CHANGED",
 
     "SPELLCAST_START", "SPELLCAST_STOP", "SPELLCAST_FAILED",
     "SPELLCAST_INTERRUPTED", "SPELLCAST_DELAYED",
@@ -439,12 +560,24 @@ local STARTS = { "SPELLCASTOTHERSTART", "SPELLPERFORMOTHERSTART" }
      interrupts %s's %s." has the interrupter first and the caster second. The
      parser returns captures in the order the *pattern* declares them, which is
      what makes reading the second one safe in a language that reorders them. ]==]
+--[==[ **The death half comes from the parser now, and it was missing three.**
+
+     This listed `UNITDIESOTHER` and `UNITDESTROYEDOTHER` and stopped there --
+     so a mob **you** killed kept its cast bar, because the client prints "You
+     have slain %s!" for that and not "%s dies." The most common death in the
+     game was the one case this did not cover.
+
+     `OB.parser.deaths` is the full list, shared with the aura store, which has
+     to forget a dead unit's debuffs for the same reason and off the same
+     sentences. One answer to "what does a death look like" instead of two. ]==]
 local STOPS = {
-    { "UNITDIESOTHER", 1 },
-    { "UNITDESTROYEDOTHER", 1 },
     { "SPELLINTERRUPTOTHEROTHER", 2 },
     { "SPELLINTERRUPTSELFOTHER", 1 },
 }
+
+for i = 1, table.getn(OB.parser.deaths) do
+    table.insert(STOPS, OB.parser.deaths[i])
+end
 
 function M:ReadCastLine(text)
     if not text then return nil end
@@ -481,6 +614,15 @@ end
 function M:OnEvent()
     if event == "SPELLS_CHANGED" or event == "LEARNED_SPELL_IN_TAB" then
         OB.RebuildSpellIcons()
+        return
+    end
+
+    --[[ What you carry changed, so the item half of the map may be wrong.
+         Forgotten rather than rebuilt here: rebuilding walks five bags and
+         nineteen slots, and `BAG_UPDATE` arrives on every loot, every sale and
+         every stack merge. The next cast pays for it, once. ]]--
+    if event == "BAG_UPDATE" or event == "UNIT_INVENTORY_CHANGED" then
+        OB.ForgetSpellIcons()
         return
     end
 

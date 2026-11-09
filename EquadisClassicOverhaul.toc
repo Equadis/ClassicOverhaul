@@ -1,6 +1,6 @@
 ## Interface: 11200
 ## Title: Equadis' Classic Overhaul
-## Version: 0.99.312
+## Version: 0.99.359
 ## X-AtlasCFM-Version: 1.70
 ## Author: Equadis
 ## Notes: All-in-one interface package with bundled Atlas-CFM, AtlasLoot, and embedded pfQuest/Turtle loot data.
@@ -45,6 +45,7 @@ CFMQuest\QuestInit.xml
 core.lua
 capabilities.lua
 config.lua
+starterprofile.lua
 profilecodes.lua
 
 # embedded vanilla vendor sell values; live/learned server values override these
@@ -57,6 +58,23 @@ pricing.lua
 data\pfquest_loot.lua
 # generated OctoWow item names, from the server's own database
 data\octowow_items.lua
+
+# What a class trainer teaches, by level. Absorbed from What's Training?
+# Turtle (Sveng; Turtle port by spawnedc and rebasedkon, MIT) -- the tables
+# verbatim, read by modules\characterpanel.lua. The table file is listed
+# first because the nine class files assign into the global it creates, and a
+# data file that assigns into a nil global takes the rest of the load order
+# down with it.
+data\training\trainingdb.lua
+data\training\druid.lua
+data\training\hunter.lua
+data\training\mage.lua
+data\training\paladin.lua
+data\training\priest.lua
+data\training\rogue.lua
+data\training\shaman.lua
+data\training\warlock.lua
+data\training\warrior.lua
 
 # rendering and placement
 render.lua
