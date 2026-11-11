@@ -97,6 +97,8 @@ driver:RegisterEvent("PLAYER_AURAS_CHANGED")
 driver:RegisterEvent("UNIT_AURA")
 driver:RegisterEvent("PLAYER_LEVEL_UP")
 driver:RegisterEvent("CHARACTER_POINTS_CHANGED")
+driver:RegisterEvent("SPELLS_CHANGED")
+driver:RegisterEvent("LEARNED_SPELL_IN_TAB")
 driver:RegisterEvent("UPDATE_SHAPESHIFT_FORM")
 driver:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" then
